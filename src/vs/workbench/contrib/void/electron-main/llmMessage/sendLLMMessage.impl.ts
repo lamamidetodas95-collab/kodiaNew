@@ -1,0 +1,1494 @@
+/*--------------------------------------------------------------------------------------
+ *  Copyright 2025 Glass Devtools, Inc. All rights reserved.
+ *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
+ *--------------------------------------------------------------------------------------*/
+
+// disable foreign import complaints
+/* eslint-disable */
+// Kodia: the provider SDKs are imported as types only, and loaded with `await import(...)` where they
+// are used. Since VS Code 1.141 the main process is bundled into a single mainImpl.js whose static
+// imports resolve before the hook that finds npm packages in node_modules.asar is installed, so a
+// static import of an npm package makes the packaged app fail to start.
+import type Anthropic from '@anthropic-ai/sdk';
+import type OpenAI from 'openai';
+import type { ClientOptions, AzureOpenAI } from 'openai';
+import type { Tool as GeminiTool, FunctionDeclaration, ThinkingConfig, Type } from '@google/genai';
+/* eslint-enable */
+
+import { AnthropicLLMChatMessage, GeminiLLMChatMessage, LLMChatMessage, LLMFIMMessage, LLMUsage, ModelListParams, OllamaModelResponse, OnError, OnFinalMessage, OnText, RawToolCallObj, RawToolParamsObj } from '../../common/sendLLMMessageTypes.js';
+import { ChatMode, displayInfoOfProviderName, ModelSelectionOptions, OverridesOfModel, ProviderName, SettingsOfProvider } from '../../common/voidSettingsTypes.js';
+import { getSendableReasoningInfo, getModelCapabilities, getProviderCapabilities, defaultProviderSettings, getReservedOutputTokenSpace, anthropicModelFeatures } from '../../common/modelCapabilities.js';
+import { extractReasoningWrapper, extractXMLToolsWrapper } from './extractGrammar.js';
+import { availableTools, InternalToolInfo } from '../../common/prompt/prompts.js';
+import { geminiParametersOfTool, jsonSchemaOfTool } from '../../common/toolSchema.js';
+import { generateUuid } from '../../../../../base/common/uuid.js';
+import { estimateTokens } from '../../common/tokenizer.js';
+import { mlxMaxOutputTokens, withOutputLimitNotice } from '../../common/outputLimit.js';
+import { mlxErrorWithHint, withoutEndOfTurnTokens } from '../../common/mlxInstalls.js';
+import { jsonToolCallOfText } from '../../common/jsonToolCall.js';
+import { KODIA_REPO_URL } from '../../common/kodiaLinks.js';
+import { createHash } from 'crypto';
+
+const getGoogleApiKey = async () => {
+	const { GoogleAuth } = await import('google-auth-library')
+	// module‑level singleton
+	const auth = new GoogleAuth({ scopes: `https://www.googleapis.com/auth/cloud-platform` });
+	const key = await auth.getAccessToken()
+	if (!key) throw new Error(`Google API failed to generate a key.`)
+	return key
+}
+
+
+
+
+type InternalCommonMessageParams = {
+	onText: OnText;
+	onFinalMessage: OnFinalMessage;
+	onError: OnError;
+	providerName: ProviderName;
+	settingsOfProvider: SettingsOfProvider;
+	modelSelectionOptions: ModelSelectionOptions | undefined;
+	overridesOfModel: OverridesOfModel | undefined;
+	modelName: string;
+	_setAborter: (aborter: () => void) => void;
+}
+
+type SendChatParams_Internal = InternalCommonMessageParams & {
+	messages: LLMChatMessage[];
+	separateSystemMessage: string | undefined;
+	chatMode: ChatMode | null;
+	mcpTools: InternalToolInfo[] | undefined;
+	promptCacheKey?: string;
+	promptCacheTTL?: '1h';
+	prediction?: string;
+	tools?: InternalToolInfo[];
+}
+type SendFIMParams_Internal = InternalCommonMessageParams & { messages: LLMFIMMessage; separateSystemMessage: string | undefined; promptCacheKey?: string; }
+export type ListParams_Internal<ModelResponse> = ModelListParams<ModelResponse>
+
+
+const invalidApiKeyMessage = (providerName: ProviderName) => `Invalid ${displayInfoOfProviderName(providerName).title} API key.`
+
+/** The OpenAI SDK only reads JSON `error.message`; Mistral often returns FastAPI-shaped `detail`/`message`. Without this remap: "422 status code (no body)". */
+const openAICompatibleErrorMessageFromParsedBody = (parsed: unknown, rawText: string, status: number): string => {
+	if (parsed !== undefined && parsed !== null && typeof parsed === 'object') {
+		const o = parsed as Record<string, unknown>
+		const nested = typeof o.error === 'object' && o.error !== null ? (o.error as { message?: unknown }).message : undefined
+		if (typeof nested === 'string') return nested
+		if (typeof o.message === 'string') return o.message
+		if (typeof o.detail === 'string') return o.detail
+		if (Array.isArray(o.detail)) {
+			return o.detail.map((item: unknown) => {
+				if (item && typeof item === 'object' && typeof (item as { msg?: unknown }).msg === 'string') return (item as { msg: string }).msg
+				try { return JSON.stringify(item) } catch { return String(item) }
+			}).join('; ')
+		}
+	}
+	const t = (rawText || '').trim()
+	if (t.length) return t.length > 4000 ? t.slice(0, 3997) + '...' : t
+	return `HTTP ${status}`
+}
+
+type OpenAIClientFetchArgs = Parameters<NonNullable<ClientOptions['fetch']>>
+
+/** OpenAI typings use node-fetch shapes in Node; Electron uses global fetch — bridge with explicit casts. */
+const openAITolerantFetch = (async (url: OpenAIClientFetchArgs[0], init?: OpenAIClientFetchArgs[1]) => {
+	const res = await globalThis.fetch(
+		url as string | URL | Request,
+		init as Parameters<typeof globalThis.fetch>[1],
+	)
+	if (res.ok)
+		return res
+	const rawText = await res.text().catch(() => '')
+	let parsed: unknown
+	try {
+		parsed = rawText ? JSON.parse(rawText) : undefined
+	} catch {
+		parsed = undefined
+	}
+	const message = openAICompatibleErrorMessageFromParsedBody(parsed, rawText, res.status)
+	return new Response(JSON.stringify({ error: { message } }), {
+		status: res.status,
+		statusText: res.statusText,
+		headers: res.headers,
+	})
+}) as unknown as NonNullable<ClientOptions['fetch']>
+
+// ------------ OPENAI-COMPATIBLE (HELPERS) ------------
+
+
+
+const parseHeadersJSON = (s: string | undefined): Record<string, string | null | undefined> | undefined => {
+	if (!s) return undefined
+	try {
+		return JSON.parse(s)
+	} catch (e) {
+		throw new Error(`Error parsing OpenAI-Compatible headers: ${s} is not a valid JSON.`)
+	}
+}
+
+const newOpenAICompatibleSDK = async ({ settingsOfProvider, providerName }: { settingsOfProvider: SettingsOfProvider, providerName: ProviderName }) => {
+	const { default: OpenAI, AzureOpenAI } = await import('openai')
+	// Pick only the fields we actually set: typing this as the full ClientOptions would spread
+	// every optional field (e.g. openai v6's nullable `apiKey`, the new `provider`) into the
+	// AzureOpenAI construction below, which declares stricter `apiKey`/`provider` types.
+	const commonPayloadOpts: Pick<ClientOptions, 'dangerouslyAllowBrowser' | 'fetch'> = {
+		dangerouslyAllowBrowser: true,
+		fetch: openAITolerantFetch,
+	}
+	if (providerName === 'openAI') {
+		const thisConfig = settingsOfProvider[providerName]
+		return new OpenAI({ apiKey: thisConfig.apiKey, ...commonPayloadOpts })
+	}
+	else if (providerName === 'ollama') {
+		const thisConfig = settingsOfProvider[providerName]
+		return new OpenAI({ baseURL: `${thisConfig.endpoint}/v1`, apiKey: 'noop', ...commonPayloadOpts })
+	}
+	else if (providerName === 'vLLM') {
+		const thisConfig = settingsOfProvider[providerName]
+		return new OpenAI({ baseURL: `${thisConfig.endpoint}/v1`, apiKey: 'noop', ...commonPayloadOpts })
+	}
+	else if (providerName === 'liteLLM') {
+		const thisConfig = settingsOfProvider[providerName]
+		return new OpenAI({ baseURL: `${thisConfig.endpoint}/v1`, apiKey: 'noop', ...commonPayloadOpts })
+	}
+	else if (providerName === 'lmStudio') {
+		const thisConfig = settingsOfProvider[providerName]
+		return new OpenAI({ baseURL: `${thisConfig.endpoint}/v1`, apiKey: 'noop', ...commonPayloadOpts })
+	}
+	else if (providerName === 'mlx') {
+		const thisConfig = settingsOfProvider[providerName]
+		return new OpenAI({ baseURL: `${thisConfig.endpoint}/v1`, apiKey: 'noop', ...commonPayloadOpts })
+	}
+	else if (providerName === 'openRouter') {
+		const thisConfig = settingsOfProvider[providerName]
+		return new OpenAI({
+			baseURL: 'https://openrouter.ai/api/v1',
+			apiKey: thisConfig.apiKey,
+			// Kodia's app on OpenRouter (rankings, marketplace), in its coding categories — https://openrouter.ai/docs/app-attribution
+			defaultHeaders: {
+				'HTTP-Referer': KODIA_REPO_URL, // the app's identifier
+				'X-OpenRouter-Title': 'Kodia',
+				'X-OpenRouter-Categories': 'ide-extension,programming-app', // at most 2 per request
+			},
+			...commonPayloadOpts,
+		})
+	}
+	else if (providerName === 'googleVertex') {
+		// https://cloud.google.com/vertex-ai/generative-ai/docs/multimodal/call-vertex-using-openai-library
+		const thisConfig = settingsOfProvider[providerName]
+		const baseURL = `https://${thisConfig.region}-aiplatform.googleapis.com/v1/projects/${thisConfig.project}/locations/${thisConfig.region}/endpoints/${'openapi'}`
+		const apiKey = await getGoogleApiKey()
+		return new OpenAI({ baseURL: baseURL, apiKey: apiKey, ...commonPayloadOpts })
+	}
+	else if (providerName === 'microsoftAzure') {
+		// https://learn.microsoft.com/en-us/rest/api/aifoundry/model-inference/get-chat-completions/get-chat-completions?view=rest-aifoundry-model-inference-2024-05-01-preview&tabs=HTTP
+		//  https://github.com/openai/openai-node?tab=readme-ov-file#microsoft-azure-openai
+		const thisConfig = settingsOfProvider[providerName]
+		const endpoint = `https://${thisConfig.project}.openai.azure.com/`;
+		const apiVersion = thisConfig.azureApiVersion ?? '2024-04-01-preview';
+		const options = { endpoint, apiKey: thisConfig.apiKey, apiVersion };
+		return new AzureOpenAI({ ...options, ...commonPayloadOpts });
+	}
+	else if (providerName === 'awsBedrock') {
+		/**
+		  * We treat Bedrock as *OpenAI-compatible only through a proxy*:
+		  *   • LiteLLM default → http://localhost:4000/v1
+		  *   • Bedrock-Access-Gateway → https://<api-id>.execute-api.<region>.amazonaws.com/openai/
+		  *
+		  * The native Bedrock runtime endpoint
+		  *   https://bedrock-runtime.<region>.amazonaws.com
+		  * is **NOT** OpenAI-compatible, so we do *not* fall back to it here.
+		  */
+		const { endpoint, apiKey } = settingsOfProvider.awsBedrock
+
+		// ① use the user-supplied proxy if present
+		// ② otherwise default to local LiteLLM
+		let baseURL = endpoint || 'http://localhost:4000/v1'
+
+		// Normalize: make sure we end with “/v1”
+		if (!baseURL.endsWith('/v1'))
+			baseURL = baseURL.replace(/\/+$/, '') + '/v1'
+
+		return new OpenAI({ baseURL, apiKey, ...commonPayloadOpts })
+	}
+
+
+	else if (providerName === 'deepseek') {
+		const thisConfig = settingsOfProvider[providerName]
+		return new OpenAI({ baseURL: 'https://api.deepseek.com/v1', apiKey: thisConfig.apiKey, ...commonPayloadOpts })
+	}
+	else if (providerName === 'openAICompatible') {
+		const thisConfig = settingsOfProvider[providerName]
+		const headers = parseHeadersJSON(thisConfig.headersJSON)
+		return new OpenAI({ baseURL: thisConfig.endpoint, apiKey: thisConfig.apiKey, defaultHeaders: headers, ...commonPayloadOpts })
+	}
+	else if (providerName === 'groq') {
+		const thisConfig = settingsOfProvider[providerName]
+		return new OpenAI({ baseURL: 'https://api.groq.com/openai/v1', apiKey: thisConfig.apiKey, ...commonPayloadOpts })
+	}
+	else if (providerName === 'xAI') {
+		const thisConfig = settingsOfProvider[providerName]
+		return new OpenAI({ baseURL: 'https://api.x.ai/v1', apiKey: thisConfig.apiKey, ...commonPayloadOpts })
+	}
+	else if (providerName === 'mistral') {
+		const thisConfig = settingsOfProvider[providerName]
+		return new OpenAI({ baseURL: 'https://api.mistral.ai/v1', apiKey: thisConfig.apiKey, ...commonPayloadOpts })
+	}
+	else if (providerName === 'nineRouter') {
+		// Kodia: 9Router integration - smart router with auto-fallback
+		const thisConfig = settingsOfProvider[providerName]
+		return new OpenAI({
+			baseURL: `${thisConfig.endpoint}/v1`,
+			apiKey: thisConfig.apiKey || 'noop', // 9Router may not require API key for free tiers
+			...commonPayloadOpts
+		})
+	}
+
+	else throw new Error(`Kodia providerName was invalid: ${providerName}.`)
+}
+
+
+const _sendOpenAICompatibleFIM = async ({ messages: { prefix, suffix, stopTokens }, onFinalMessage, onError, settingsOfProvider, modelName: modelName_, _setAborter, providerName, overridesOfModel }: SendFIMParams_Internal) => {
+	const { default: OpenAI } = await import('openai')
+
+	const {
+		modelName,
+		supportsFIM,
+		additionalOpenAIPayload,
+	} = getModelCapabilities(providerName, modelName_, overridesOfModel)
+
+	if (!supportsFIM) {
+		if (modelName === modelName_)
+			onError({ message: `Model ${modelName} does not support FIM.`, fullError: null })
+		else
+			onError({ message: `Model ${modelName_} (${modelName}) does not support FIM.`, fullError: null })
+		return
+	}
+
+	const openai = await newOpenAICompatibleSDK({ providerName, settingsOfProvider })
+	openai.completions
+		.create({
+			model: modelName,
+			prompt: prefix,
+			suffix: suffix,
+			stop: stopTokens,
+			max_tokens: 300,
+			...additionalOpenAIPayload,
+		})
+		.then(async response => {
+			const fullText = response.choices[0]?.text
+			onFinalMessage({ fullText, fullReasoning: '', anthropicReasoning: null });
+		})
+		.catch(error => {
+			if (error instanceof OpenAI.APIError && error.status === 401) { onError({ message: invalidApiKeyMessage(providerName), fullError: error }); }
+			else { onError({ message: error + '', fullError: error }); }
+		})
+}
+
+
+const toOpenAICompatibleTool = (toolInfo: InternalToolInfo) => {
+	const { name, description } = toolInfo
+
+	return {
+		type: 'function',
+		function: {
+			name: name,
+			// strict: true, // strict mode - https://platform.openai.com/docs/guides/function-calling?api-mode=chat
+			description: description,
+			// the types and required parameters the tool's schema declares; strings, none required, without one
+			parameters: jsonSchemaOfTool(toolInfo),
+		}
+	} satisfies OpenAI.Chat.Completions.ChatCompletionTool
+}
+
+const openAITools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, explicitTools: InternalToolInfo[] | undefined) => {
+	const allowedTools = availableTools(chatMode, mcpTools, explicitTools)
+	if (!allowedTools || Object.keys(allowedTools).length === 0) return null
+
+	const openAITools: OpenAI.Chat.Completions.ChatCompletionTool[] = []
+	for (const t in allowedTools ?? {}) {
+		openAITools.push(toOpenAICompatibleTool(allowedTools[t]))
+	}
+	return openAITools
+}
+
+
+// convert LLM tool call to our tool format
+const rawToolCallObjOfParamsStr = (name: string, toolParamsStr: string, id: string): RawToolCallObj | null => {
+	let input: unknown
+	try { input = JSON.parse(toolParamsStr) }
+	catch (e) { return null }
+
+	if (input === null) return null
+	if (typeof input !== 'object') return null
+
+	const rawParams: RawToolParamsObj = input
+	return { id, name, rawParams, doneParams: Object.keys(rawParams), isDone: true }
+}
+
+
+// a tool call whose name/id/params arrive in pieces while streaming
+type StreamedToolCall = { name: string; id: string; paramsStr: string }
+
+// the call currently being generated (the latest one), for display while streaming
+const streamingToolCallOf = (calls: StreamedToolCall[]): RawToolCallObj | undefined => {
+	for (let i = calls.length - 1; i >= 0; i -= 1) {
+		const t = calls[i] // may be a hole if indexes arrive out of order
+		if (t?.name) return { name: t.name, rawParams: {}, isDone: false, doneParams: [], id: t.id }
+	}
+	return undefined
+}
+
+// calls whose params aren't valid JSON are dropped, as before
+const finalToolCallsOf = (calls: StreamedToolCall[]): RawToolCallObj[] =>
+	calls.filter(t => !!t?.name)
+		.map(t => rawToolCallObjOfParamsStr(t.name, t.paramsStr, t.id))
+		.filter((t): t is RawToolCallObj => t !== null)
+
+const rawToolCallObjOfAnthropicParams = (toolBlock: Anthropic.Messages.ToolUseBlock): RawToolCallObj | null => {
+	const { id, name, input } = toolBlock
+
+	if (input === null) return null
+	if (typeof input !== 'object') return null
+
+	const rawParams: RawToolParamsObj = input
+	return { id, name, rawParams, doneParams: Object.keys(rawParams), isDone: true }
+}
+
+
+// ------------ OPENAI-COMPATIBLE ------------
+
+// Most OpenAI-compatible providers return `delta.content` as a plain string. Some (notably Mistral's
+// magistral reasoning models) instead return an array of content chunks, e.g.
+//   [{ type: 'thinking', thinking: [{ type: 'text', text: '...' }] }, { type: 'text', text: '...' }]
+// Concatenating that array directly coerces each object to "[object Object]" in the chat, so split it
+// into plain text + reasoning here.
+const parseOpenAICompatibleDeltaContent = (content: unknown): { text: string; reasoning: string } => {
+	if (content == null) return { text: '', reasoning: '' }
+	if (typeof content === 'string') return { text: content, reasoning: '' }
+	if (!Array.isArray(content)) return { text: '', reasoning: '' }
+
+	const chunkText = (chunk: unknown): string => {
+		if (typeof chunk === 'string') return chunk
+		if (chunk && typeof chunk === 'object' && typeof (chunk as { text?: unknown }).text === 'string') return (chunk as { text: string }).text
+		return ''
+	}
+
+	let text = ''
+	let reasoning = ''
+	for (const chunk of content) {
+		if (typeof chunk === 'string') { text += chunk; continue }
+		if (!chunk || typeof chunk !== 'object') continue
+		if ((chunk as { type?: unknown }).type === 'thinking') {
+			const thinking = (chunk as { thinking?: unknown }).thinking
+			if (typeof thinking === 'string') reasoning += thinking
+			else if (Array.isArray(thinking)) for (const t of thinking) reasoning += chunkText(t)
+		}
+		else { // 'text' chunk (or any other chunk that carries a string `.text`)
+			text += chunkText(chunk)
+		}
+	}
+	return { text, reasoning }
+}
+
+
+// convertToLLMMessageService (browser side) trims message *content* against contextWindow, but it
+// has no visibility into the tool-call schemas assembled here in the main process. That's invisible
+// slack on any normal-sized context window, but on tiny local models (a 4k-token window) the tool
+// schemas alone can be a third of the whole budget —
+// so a request that looks correctly trimmed still overflows the real session limit. Only kicks in
+// below SMALL_CONTEXT_WINDOW_THRESHOLD so normal cloud providers pay no extra tokenization cost.
+const SMALL_CONTEXT_WINDOW_THRESHOLD = 16_000
+const _messageContentText = (content: unknown): string => {
+	if (typeof content === 'string') return content
+	if (Array.isArray(content)) return content.map(c => (c && typeof c === 'object' && typeof (c as { text?: unknown }).text === 'string') ? (c as { text: string }).text : '').join('')
+	return ''
+}
+const _trimMessagesForToolBudget = (
+	messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+	tools: unknown,
+	contextWindow: number,
+	reservedOutputTokenSpace: number | null | undefined,
+): OpenAI.Chat.Completions.ChatCompletionMessageParam[] => {
+	if (contextWindow > SMALL_CONTEXT_WINDOW_THRESHOLD || !tools) return messages
+
+	const toolTokens = estimateTokens(JSON.stringify(tools))
+	const outputSpace = Math.max(contextWindow * 1 / 2, reservedOutputTokenSpace ?? 4_096)
+	const budget = Math.max(contextWindow - outputSpace - toolTokens, 1_250)
+
+	const msgs = messages.map(m => ({ ...m }))
+	let overflow = msgs.reduce((sum, m) => sum + estimateTokens(_messageContentText(m.content)), 0) - budget
+
+	let guard = 0
+	while (overflow > 0 && guard < 100) {
+		guard += 1
+		// trim the single largest message, keeping the first and last messages intact (usually the
+		// system/task-setup message and the most recent turn — the ones most worth preserving)
+		let largestIdx = -1
+		let largestTokens = -1
+		for (let i = 1; i < msgs.length - 1; i += 1) {
+			if (typeof msgs[i].content !== 'string') continue // don't touch multimodal content
+			const t = estimateTokens(msgs[i].content as string)
+			if (t > largestTokens) { largestTokens = t; largestIdx = i }
+		}
+		if (largestIdx === -1 || largestTokens <= 0) break
+
+		const m = msgs[largestIdx]
+		const content = m.content as string
+		const charsPerToken = content.length / largestTokens
+		const charsToRemove = Math.ceil(Math.min(overflow, largestTokens) * charsPerToken)
+		const targetLen = Math.max(content.length - charsToRemove - 3, 0)
+		m.content = content.slice(0, targetLen).trim() + '...'
+		overflow -= largestTokens - estimateTokens(m.content as string)
+	}
+	return msgs
+}
+
+// Providers known to accept `stream_options.include_usage`. Others (local servers, Azure's default
+// API version) may reject the unknown param; we still read `usage` from them if they send it anyway.
+const providersWithStreamUsageOption: ReadonlySet<ProviderName> = new Set<ProviderName>(['openAI', 'openRouter', 'xAI', 'deepseek'])
+
+// These providers cache prompt prefixes on their own; sending the same key for requests that share a prefix
+// (a thread's agent loop) routes them to the same cache and raises the hit rate. Strict APIs reject unknown
+// params, so only providers that document it get it.
+// https://docs.mistral.ai/studio-api/conversations/advanced/prompt-caching
+// https://developers.openai.com/api/docs/guides/prompt-caching
+const providersWithPromptCacheKey: ReadonlySet<ProviderName> = new Set<ProviderName>(['mistral', 'openAI'])
+// xAI takes the same routing key as a header on Chat Completions.
+// https://docs.x.ai/developers/advanced-api-usage/prompt-caching/maximizing-cache-hits
+const promptCacheHeadersOf = (providerName: ProviderName, promptCacheKey: string | undefined): Record<string, string> | undefined =>
+	promptCacheKey && providerName === 'xAI' ? { 'x-grok-conv-id': promptCacheKey } : undefined
+
+// OpenAI-compatible `prompt_tokens` includes cached tokens (DeepSeek reports them as `prompt_cache_hit_tokens`).
+const openAICompatibleUsage = (usage: unknown): LLMUsage | undefined => {
+	if (!usage || typeof usage !== 'object') return undefined
+	const u = usage as {
+		prompt_tokens?: number; completion_tokens?: number;
+		prompt_tokens_details?: { cached_tokens?: number } | null;
+		prompt_cache_hit_tokens?: number;
+	}
+	if (typeof u.prompt_tokens !== 'number') return undefined
+	const cacheRead = u.prompt_tokens_details?.cached_tokens ?? u.prompt_cache_hit_tokens ?? 0
+	return { input: u.prompt_tokens - cacheRead, output: u.completion_tokens ?? 0, cacheRead }
+}
+
+// ---------------- xAI: PDFs through the Responses API ----------------
+// xAI reads files only once they're uploaded to its Files API and referenced from /v1/responses (input_file), not
+// from Chat Completions: https://docs.x.ai/developers/model-capabilities/files/chat-with-files
+// So a turn whose history carries a PDF goes through Responses; every other turn stays on Chat Completions.
+
+type ChatMessageParam = OpenAI.Chat.Completions.ChatCompletionMessageParam
+type InlinePdfPart = { type: 'file'; file: { filename?: string; file_data: string } } // built by convertToLLMMessageService
+
+const isInlinePdfPart = (part: unknown): part is InlinePdfPart =>
+	!!part && typeof part === 'object' && (part as { type?: unknown }).type === 'file'
+	&& typeof (part as { file?: { file_data?: unknown } }).file?.file_data === 'string'
+
+const messagesCarryPdf = (messages: ChatMessageParam[]) =>
+	messages.some(m => Array.isArray(m.content) && (m.content as unknown[]).some(isInlinePdfPart))
+
+// A PDF stays in the thread's history, so every later turn sends it again: upload it once per app session and API key.
+const xAIFileIdOfPdf = new Map<string, Promise<string>>()
+const xAIFileIdOf = (openai: OpenAI, toFile: typeof import('openai').toFile, apiKey: string, part: InlinePdfPart): Promise<string> => {
+	const base64 = part.file.file_data.slice(part.file.file_data.indexOf(',') + 1)
+	const key = createHash('sha256').update(apiKey).update('\0').update(base64).digest('hex')
+	let fileId = xAIFileIdOfPdf.get(key)
+	if (!fileId) {
+		fileId = toFile(Buffer.from(base64, 'base64'), part.file.filename || 'document.pdf', { type: 'application/pdf' })
+			.then(file => openai.files.create({ file, purpose: 'assistants' }))
+			.then(uploaded => uploaded.id)
+		fileId.catch(() => xAIFileIdOfPdf.delete(key)) // upload again on the next turn
+		xAIFileIdOfPdf.set(key, fileId)
+	}
+	return fileId
+}
+
+// Chat Completions messages (as convertToLLMMessageService builds them) to Responses input items
+const responsesInputOf = async (messages: ChatMessageParam[], fileIdOf: (part: InlinePdfPart) => Promise<string>): Promise<OpenAI.Responses.ResponseInputItem[]> => {
+	const input: OpenAI.Responses.ResponseInputItem[] = []
+	for (const m of messages) {
+		if (m.role === 'user') {
+			if (typeof m.content === 'string') { input.push({ role: 'user', content: m.content }); continue }
+			const content: OpenAI.Responses.ResponseInputMessageContentList = []
+			for (const part of m.content as unknown[]) {
+				if (isInlinePdfPart(part)) content.push({ type: 'input_file', file_id: await fileIdOf(part) })
+				else if ((part as { type?: unknown }).type === 'image_url') content.push({ type: 'input_image', image_url: (part as OpenAI.Chat.Completions.ChatCompletionContentPartImage).image_url.url, detail: 'auto' })
+				else if ((part as { type?: unknown }).type === 'text') content.push({ type: 'input_text', text: (part as OpenAI.Chat.Completions.ChatCompletionContentPartText).text })
+			}
+			input.push({ role: 'user', content })
+		}
+		else if (m.role === 'assistant') {
+			const text = _messageContentText(m.content)
+			if (text) input.push({ role: 'assistant', content: text })
+			for (const call of m.tool_calls ?? []) {
+				if (call.type === 'function') input.push({ type: 'function_call', call_id: call.id, name: call.function.name, arguments: call.function.arguments })
+			}
+		}
+		else if (m.role === 'tool') {
+			input.push({ type: 'function_call_output', call_id: m.tool_call_id, output: _messageContentText(m.content) })
+		}
+		else if (m.role === 'system' || m.role === 'developer') {
+			input.push({ role: m.role, content: _messageContentText(m.content) })
+		}
+	}
+	return input
+}
+
+const responsesUsageOf = (usage: OpenAI.Responses.ResponseUsage | undefined): LLMUsage | undefined => {
+	if (!usage) return undefined
+	const cacheRead = usage.input_tokens_details?.cached_tokens ?? 0
+	return { input: usage.input_tokens - cacheRead, output: usage.output_tokens, cacheRead }
+}
+
+const _sendXAIResponsesChat = async ({ openai, apiKey, modelName, messages, tools, extraPayload, promptCacheKey, onText, onFinalMessage, onError, _setAborter }: {
+	openai: OpenAI;
+	apiKey: string;
+	modelName: string;
+	messages: ChatMessageParam[];
+	tools: OpenAI.Chat.Completions.ChatCompletionTool[] | undefined;
+	extraPayload: object; // reasoning_effort (which xAI's Responses API also takes) and the model's additional payload
+	promptCacheKey: string | undefined;
+	onText: OnText;
+	onFinalMessage: OnFinalMessage;
+	onError: OnError;
+	_setAborter: SendChatParams_Internal['_setAborter'];
+}) => {
+	const { default: OpenAI, toFile } = await import('openai')
+	let fullTextSoFar = ''
+	let fullReasoningSoFar = ''
+	const streamedToolCalls: StreamedToolCall[] = [] // indexed by output_index; server-side tool items leave holes
+	let usage: LLMUsage | undefined
+	try {
+		const input = await responsesInputOf(messages, part => xAIFileIdOf(openai, toFile, apiKey, part))
+		const functionTools: OpenAI.Responses.FunctionTool[] = (tools ?? []).flatMap(t => t.type === 'function'
+			? [{ type: 'function', name: t.function.name, description: t.function.description, parameters: t.function.parameters ?? null, strict: false }]
+			: [])
+		const stream = await openai.responses.create({
+			model: modelName,
+			input,
+			stream: true,
+			store: false, // nothing to retrieve later; xAI would otherwise keep it for 30 days
+			...(functionTools.length ? { tools: functionTools } : {}),
+			...(promptCacheKey ? { prompt_cache_key: promptCacheKey } : {}),
+			...extraPayload,
+		} as OpenAI.Responses.ResponseCreateParamsStreaming)
+		_setAborter(() => stream.controller.abort())
+
+		for await (const event of stream) {
+			switch (event.type) {
+				case 'response.output_text.delta':
+					fullTextSoFar += event.delta
+					break
+				case 'response.reasoning_text.delta':
+				case 'response.reasoning_summary_text.delta':
+					fullReasoningSoFar += event.delta
+					break
+				case 'response.output_item.added':
+				case 'response.output_item.done': // done carries the complete arguments
+					if (event.item.type === 'function_call') {
+						streamedToolCalls[event.output_index] = { name: event.item.name, id: event.item.call_id, paramsStr: event.item.arguments ?? '' }
+					}
+					break
+				case 'response.function_call_arguments.delta': {
+					const call = streamedToolCalls[event.output_index]
+					if (call) call.paramsStr += event.delta
+					break
+				}
+				case 'response.completed':
+				case 'response.incomplete':
+					usage = responsesUsageOf(event.response.usage) ?? usage
+					break
+				case 'response.failed':
+					throw new Error(event.response.error?.message ?? 'xAI could not complete the response.')
+				case 'error':
+					throw new Error(event.message)
+			}
+			onText({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, toolCall: streamingToolCallOf(streamedToolCalls) })
+		}
+
+		const toolCalls = finalToolCallsOf(streamedToolCalls)
+		if (!fullTextSoFar && !fullReasoningSoFar && toolCalls.length === 0) {
+			onError({ message: 'Kodia: Response from model was empty.', fullError: null })
+		}
+		else {
+			onFinalMessage({ fullText: fullTextSoFar, fullReasoning: fullReasoningSoFar, anthropicReasoning: null, toolCalls, usage })
+		}
+	}
+	catch (error) {
+		if (error instanceof OpenAI.APIError && error.status === 401) { onError({ message: invalidApiKeyMessage('xAI'), fullError: error }) }
+		else { onError({ message: error + '', fullError: error }) }
+	}
+}
+
+const _sendOpenAICompatibleChat = async ({ messages, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, modelName: modelName_, _setAborter, providerName, chatMode, separateSystemMessage, overridesOfModel, mcpTools, promptCacheKey, prediction, tools }: SendChatParams_Internal) => {
+	const { default: OpenAI } = await import('openai')
+	const {
+		modelName,
+		specialToolFormat,
+		reasoningCapabilities,
+		additionalOpenAIPayload,
+		contextWindow,
+		supportsPredictedOutputs,
+	} = getModelCapabilities(providerName, modelName_, overridesOfModel)
+
+	const { providerReasoningIOSettings } = getProviderCapabilities(providerName)
+
+	// reasoning
+	const { canIOReasoning, openSourceThinkTags } = reasoningCapabilities || {}
+	const reasoningInfo = getSendableReasoningInfo('Chat', providerName, modelName_, modelSelectionOptions, overridesOfModel) // user's modelName_ here
+
+	const reasoningAndExtraPayload = {
+		...providerReasoningIOSettings?.input?.includeInPayload?.(reasoningInfo),
+		...additionalOpenAIPayload
+	}
+
+	// tools
+	const potentialTools = openAITools(chatMode, mcpTools, tools)
+	const nativeToolsObj = potentialTools && specialToolFormat === 'openai-style' ?
+		{ tools: potentialTools } as const
+		: {}
+	// the tools offered natively, by name: a local MLX model writes its call as JSON in the text, read below
+	const offeredTools = 'tools' in nativeToolsObj ? nativeToolsObj.tools : undefined
+	const offeredToolNames = offeredTools ? new Set(offeredTools.flatMap(t => t.type === 'function' ? [t.function.name] : [])) : undefined
+
+	const reservedOutputTokenSpace = getReservedOutputTokenSpace(providerName, modelName_, { isReasoningEnabled: !!reasoningInfo?.isReasoningEnabled, overridesOfModel })
+	const preparedMessages = nativeToolsObj.tools
+		? _trimMessagesForToolBudget(messages as OpenAI.Chat.Completions.ChatCompletionMessageParam[], nativeToolsObj.tools, contextWindow, reservedOutputTokenSpace)
+		: messages as any
+
+	// instance
+	const openai: OpenAI = await newOpenAICompatibleSDK({ providerName, settingsOfProvider })
+	if (providerName === 'microsoftAzure') {
+		// Required to select the model
+		(openai as AzureOpenAI).deploymentName = modelName;
+	}
+	const options: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
+		model: modelName,
+		messages: preparedMessages,
+		stream: true,
+		...(providersWithStreamUsageOption.has(providerName) ? { stream_options: { include_usage: true } } : {}),
+		...(promptCacheKey && providersWithPromptCacheKey.has(providerName) ? { prompt_cache_key: promptCacheKey } : {}),
+		// the model generates the unchanged parts of a rewrite much faster when it's told what to expect
+		...(prediction && supportsPredictedOutputs ? { prediction: { type: 'content' as const, content: prediction } } : {}),
+		...nativeToolsObj,
+		...reasoningAndExtraPayload,
+		// max_completion_tokens: maxTokens,
+		// mlx_lm.server answers at most 512 tokens when none is asked
+		...(providerName === 'mlx' ? { max_tokens: mlxMaxOutputTokens(reservedOutputTokenSpace) } : {}),
+	}
+
+	// a reply that stops at the model's output limit says so (after the wrappers below have taken the reasoning and the tools out of it)
+	let reachedOutputLimit = false
+	const onFinalMessageWithNotice = onFinalMessage
+	onFinalMessage = message => onFinalMessageWithNotice({ ...message, fullText: withOutputLimitNotice(message.fullText, reachedOutputLimit), ...(reachedOutputLimit ? { reachedOutputLimit } : {}) })
+
+	// open source models - manually parse think tokens
+	const { needsManualParse: needsManualReasoningParse, nameOfFieldInDelta: nameOfReasoningFieldInDelta } = providerReasoningIOSettings?.output ?? {}
+	const manuallyParseReasoning = needsManualReasoningParse && canIOReasoning && openSourceThinkTags
+	if (manuallyParseReasoning) {
+		const { newOnText, newOnFinalMessage } = extractReasoningWrapper(onText, onFinalMessage, openSourceThinkTags)
+		onText = newOnText
+		onFinalMessage = newOnFinalMessage
+	}
+
+	// manually parse out tool results if XML
+	if (!specialToolFormat) {
+		const { newOnText, newOnFinalMessage } = extractXMLToolsWrapper(onText, onFinalMessage, chatMode, mcpTools, tools)
+		onText = newOnText
+		onFinalMessage = newOnFinalMessage
+	}
+
+	let fullReasoningSoFar = ''
+	let fullTextSoFar = ''
+	// mlx_lm.server writes the model's end-of-turn token at the end of a reply
+	const shownText = (text: string) => providerName === 'mlx' ? withoutEndOfTurnTokens(text) : text
+
+	// one entry per parallel tool call; deltas name the call they extend by `index`
+	const streamedToolCalls: StreamedToolCall[] = []
+
+	let usage: LLMUsage | undefined
+
+	// xAI reads PDFs only through its Responses API
+	if (providerName === 'xAI' && messagesCarryPdf(preparedMessages)) {
+		_sendXAIResponsesChat({ openai, apiKey: settingsOfProvider.xAI.apiKey, modelName, messages: preparedMessages, tools: nativeToolsObj.tools, extraPayload: reasoningAndExtraPayload, promptCacheKey, onText, onFinalMessage, onError, _setAborter })
+		return
+	}
+
+	const promptCacheHeaders = promptCacheHeadersOf(providerName, promptCacheKey)
+	openai.chat.completions
+		.create(options, promptCacheHeaders ? { headers: promptCacheHeaders } : undefined)
+		.then(async response => {
+			_setAborter(() => response.controller.abort())
+			// when receive text
+			for await (const chunk of response) {
+				// usually only on the last chunk (Groq nests it under x_groq)
+				usage = openAICompatibleUsage(chunk.usage ?? (chunk as { x_groq?: { usage?: unknown } }).x_groq?.usage) ?? usage
+				if (chunk.choices[0]?.finish_reason === 'length') reachedOutputLimit = true
+
+				// message (delta.content is usually a string, but Mistral magistral returns an array of content chunks)
+				const { text: newText, reasoning: newReasoningFromContent } = parseOpenAICompatibleDeltaContent(chunk.choices[0]?.delta?.content)
+				fullTextSoFar += newText
+				fullReasoningSoFar += newReasoningFromContent
+
+				// tool calls
+				const toolDeltas = chunk.choices[0]?.delta?.tool_calls ?? []
+				for (let j = 0; j < toolDeltas.length; j += 1) {
+					const tool = toolDeltas[j]
+					const t = streamedToolCalls[tool.index ?? j] ??= { name: '', id: '', paramsStr: '' } // some servers omit index
+					t.name += tool.function?.name ?? ''
+					t.paramsStr += tool.function?.arguments ?? ''
+					t.id += tool.id ?? ''
+				}
+
+
+				// reasoning
+				let newReasoning = ''
+				if (nameOfReasoningFieldInDelta) {
+					// @ts-ignore
+					newReasoning = (chunk.choices[0]?.delta?.[nameOfReasoningFieldInDelta] || '') + ''
+					fullReasoningSoFar += newReasoning
+				}
+
+				// call onText
+				onText({
+					fullText: shownText(fullTextSoFar),
+					fullReasoning: fullReasoningSoFar,
+					toolCall: streamingToolCallOf(streamedToolCalls),
+				})
+
+			}
+			// on final
+			let toolCalls = finalToolCallsOf(streamedToolCalls)
+			// a local MLX model offered the tools natively writes its call as JSON in the text: it is read as the call
+			if (toolCalls.length === 0 && providerName === 'mlx' && offeredToolNames) {
+				const json = jsonToolCallOfText(fullTextSoFar, offeredToolNames, generateUuid())
+				if (json) {
+					fullTextSoFar = json.text
+					toolCalls = [json.call]
+				}
+			}
+			if (!fullTextSoFar && !fullReasoningSoFar && toolCalls.length === 0) {
+				onError({ message: 'Kodia: Response from model was empty.', fullError: null })
+			}
+			else {
+				onFinalMessage({ fullText: shownText(fullTextSoFar), fullReasoning: fullReasoningSoFar, anthropicReasoning: null, toolCalls, usage });
+			}
+		})
+		// when error/fail - this catches errors of both .create() and .then(for await)
+		.catch(error => {
+			if (error instanceof OpenAI.APIError && error.status === 401) { onError({ message: invalidApiKeyMessage(providerName), fullError: error }); }
+			else { onError({ message: providerName === 'mlx' ? mlxErrorWithHint(error + '') : error + '', fullError: error }); }
+		})
+}
+
+
+
+type OpenAIModel = {
+	id: string;
+	created: number;
+	object: 'model';
+	owned_by: string;
+}
+// LM Studio's listing of its models (https://lmstudio.ai/docs/app/api/endpoints/rest), by model id. Empty when the
+// server has no such endpoint or doesn't answer in time: the models are then listed without these details.
+const lmStudioModelDetails = async (endpoint: string): Promise<Map<string, object>> => {
+	const details = new Map<string, object>()
+	try {
+		const response = await fetch(`${endpoint}/api/v0/models`, { signal: AbortSignal.timeout(3_000) })
+		if (!response.ok) return details
+		const json = await response.json() as { data?: unknown }
+		for (const model of Array.isArray(json.data) ? json.data : []) {
+			if (model && typeof model === 'object' && typeof model.id === 'string') details.set(model.id, model)
+		}
+	}
+	catch { }
+	return details
+}
+
+const _openaiCompatibleList = async ({ onSuccess: onSuccess_, onError: onError_, settingsOfProvider, providerName }: ListParams_Internal<OpenAIModel>) => {
+	const onSuccess = ({ models }: { models: OpenAIModel[] }) => {
+		onSuccess_({ models })
+	}
+	const onError = ({ error }: { error: string }) => {
+		onError_({ error })
+	}
+	try {
+		const openai = await newOpenAICompatibleSDK({ providerName, settingsOfProvider })
+		openai.models.list()
+			.then(async (response) => {
+				const models: OpenAIModel[] = []
+				models.push(...response.data)
+				while (response.hasNextPage()) {
+					models.push(...(await response.getNextPage()).data)
+				}
+				// LM Studio says the context window a model is loaded with in its own listing, not in /v1/models
+				if (providerName === 'lmStudio') {
+					const details = await lmStudioModelDetails(settingsOfProvider.lmStudio.endpoint)
+					onSuccess({ models: models.map(model => ({ ...details.get(model.id), ...model })) })
+					return
+				}
+				onSuccess({ models })
+			})
+			.catch((error) => {
+				onError({ error: error + '' })
+			})
+	}
+	catch (error) {
+		onError({ error: error + '' })
+	}
+}
+
+
+
+
+// ------------ ANTHROPIC (HELPERS) ------------
+const toAnthropicTool = (toolInfo: InternalToolInfo) => {
+	const { name, description } = toolInfo
+	return {
+		name: name,
+		description: description,
+		input_schema: jsonSchemaOfTool(toolInfo),
+	} satisfies Anthropic.Messages.Tool
+}
+
+// Prompt caching: unlike OpenAI, DeepSeek and Gemini, Anthropic only caches up to explicit
+// `cache_control` breakpoints. The agent loop resends the whole thread on every tool call, so we mark
+// the end of the tools, the system prompt and the latest message — each request then reads the
+// previous request's prefix from cache. The API silently ignores breakpoints below the model's
+// minimum cacheable length, so short chats need no special-casing. (4 breakpoints max; we use 3.)
+// 5 minutes by default; 1 hour (2x write price instead of 1.25x) keeps the thread cached when the user takes
+// longer than 5 minutes to reply. All breakpoints use the same TTL (a 1h entry may not follow a 5m one).
+type AnthropicCacheControl = { type: 'ephemeral'; ttl?: '1h' }
+const anthropicCacheControlOf = (ttl: '1h' | undefined): AnthropicCacheControl => ttl ? { type: 'ephemeral', ttl } : { type: 'ephemeral' }
+
+const anthropicTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, explicitTools: InternalToolInfo[] | undefined, cacheControl: AnthropicCacheControl) => {
+	const allowedTools = availableTools(chatMode, mcpTools, explicitTools)
+	if (!allowedTools || Object.keys(allowedTools).length === 0) return null
+
+	const anthropicTools: Anthropic.Messages.Tool[] = []
+	for (const t in allowedTools ?? {}) {
+		anthropicTools.push(toAnthropicTool(allowedTools[t]))
+	}
+	// tools render before the system prompt, so they stay cached even when the system prompt changes (e.g. open files)
+	anthropicTools[anthropicTools.length - 1] = { ...anthropicTools[anthropicTools.length - 1], cache_control: cacheControl }
+	return anthropicTools
+}
+
+const anthropicSystemWithCacheControl = (system: string | undefined, cacheControl: AnthropicCacheControl): Anthropic.Messages.TextBlockParam[] | undefined => {
+	if (!system) return undefined
+	return [{ type: 'text', text: system, cache_control: cacheControl }]
+}
+
+// thinking blocks can't carry cache_control, and the API rejects it on empty text
+const _canCarryCacheControl = (block: { type: string; text?: string }) =>
+	block.type === 'text' ? !!block.text : (block.type === 'tool_result' || block.type === 'tool_use' || block.type === 'image')
+
+const anthropicMessagesWithCacheControl = (messages: AnthropicLLMChatMessage[], cacheControl: AnthropicCacheControl): Anthropic.Messages.MessageParam[] => {
+	const out = messages.slice() as Anthropic.Messages.MessageParam[]
+	// the latest user/assistant message: a trailing `role: "system"` message (editor context) stays after the breakpoint
+	let lastIdx = out.length - 1
+	while (lastIdx >= 0 && out[lastIdx].role === 'system') lastIdx -= 1
+	if (lastIdx < 0) return out
+	const last = out[lastIdx]
+	if (last.role === 'system') return out // skipped above: tells TypeScript the message is a user or assistant one
+
+	if (typeof last.content === 'string') {
+		if (last.content) out[lastIdx] = { ...last, content: [{ type: 'text', text: last.content, cache_control: cacheControl }] }
+		return out
+	}
+
+	const blocks = last.content.slice()
+	for (let i = blocks.length - 1; i >= 0; i -= 1) {
+		if (_canCarryCacheControl(blocks[i] as { type: string; text?: string })) {
+			blocks[i] = { ...blocks[i], cache_control: cacheControl } as Anthropic.Messages.ContentBlockParam
+			break
+		}
+	}
+	out[lastIdx] = { ...last, content: blocks }
+	return out
+}
+
+// Fills in the thinking options only some models accept (see anthropicModelFeatures).
+const THINKING_BINDING_BETA = 'thinking-binding-controls-2026-08-01'
+const anthropicThinkingOptions = (recognizedModelName: string | undefined, payload: { [key: string]: unknown }) => {
+	const thinking = payload.thinking as { type?: string } | undefined
+	if (!recognizedModelName || thinking?.type !== 'adaptive') return { payload, betas: [] as string[] }
+
+	const betas: string[] = []
+	const newThinking: { [key: string]: unknown } = { ...thinking }
+	// without it, these models return empty thinking text and the reasoning panel stays blank
+	if (anthropicModelFeatures.summarizedThinkingDisplay.has(recognizedModelName)) newThinking.display = 'summarized'
+	// Thinking blocks are bound to everything before them; Kodia's history can legitimately change (a new turn's
+	// system prompt, a model switch, context clearing). Drop the stale blocks instead of failing with a 400.
+	if (anthropicModelFeatures.thinkingBlockBinding.has(recognizedModelName)) {
+		newThinking.block_binding = { prefix_mismatch_behavior: 'drop_block' }
+		betas.push(THINKING_BINDING_BETA)
+	}
+	return { payload: { ...payload, thinking: newThinking }, betas }
+}
+
+// Anthropic's `input_tokens` already excludes cached tokens, so the fields map 1:1.
+const anthropicUsage = (usage: Anthropic.Messages.Usage): LLMUsage => ({
+	input: usage.input_tokens,
+	output: usage.output_tokens,
+	cacheRead: usage.cache_read_input_tokens ?? undefined,
+	cacheWrite: usage.cache_creation_input_tokens ?? undefined,
+})
+
+
+
+// ------------ ANTHROPIC ------------
+const sendAnthropicChat = async ({ messages, providerName, onText, onFinalMessage, onError, settingsOfProvider, modelSelectionOptions, overridesOfModel, modelName: modelName_, _setAborter, separateSystemMessage, chatMode, mcpTools, promptCacheTTL, tools }: SendChatParams_Internal) => {
+	const { default: Anthropic } = await import('@anthropic-ai/sdk')
+	const {
+		modelName,
+		recognizedModelName,
+		specialToolFormat,
+	} = getModelCapabilities(providerName, modelName_, overridesOfModel)
+
+	const thisConfig = settingsOfProvider.anthropic
+	const { providerReasoningIOSettings } = getProviderCapabilities(providerName)
+
+	// reasoning
+	const reasoningInfo = getSendableReasoningInfo('Chat', providerName, modelName_, modelSelectionOptions, overridesOfModel) // user's modelName_ here
+	const { payload: includeInPayload, betas } = anthropicThinkingOptions(recognizedModelName, providerReasoningIOSettings?.input?.includeInPayload?.(reasoningInfo) || {})
+
+	const cacheControl = anthropicCacheControlOf(promptCacheTTL)
+
+	// anthropic-specific - max tokens
+	const maxTokens = getReservedOutputTokenSpace(providerName, modelName_, { isReasoningEnabled: !!reasoningInfo?.isReasoningEnabled, overridesOfModel })
+
+	// tools
+	const potentialTools = anthropicTools(chatMode, mcpTools, tools, cacheControl)
+	const nativeToolsObj = potentialTools && specialToolFormat === 'anthropic-style' ?
+		{ tools: potentialTools, tool_choice: { type: 'auto' } } as const
+		: {}
+
+
+	// instance
+	const anthropic = new Anthropic({
+		apiKey: thisConfig.apiKey,
+		dangerouslyAllowBrowser: true
+	});
+
+	const stream = anthropic.messages.stream({
+		system: anthropicSystemWithCacheControl(separateSystemMessage, cacheControl),
+		messages: anthropicMessagesWithCacheControl(messages as AnthropicLLMChatMessage[], cacheControl),
+		model: modelName,
+		max_tokens: maxTokens ?? 4_096, // anthropic requires this
+		...includeInPayload,
+		...nativeToolsObj,
+
+	}, betas.length ? { headers: { 'anthropic-beta': betas.join(',') } } : undefined)
+
+	// a reply that stops at the model's output limit says so
+	let reachedOutputLimit = false
+	const onFinalMessageWithNotice = onFinalMessage
+	onFinalMessage = message => onFinalMessageWithNotice({ ...message, fullText: withOutputLimitNotice(message.fullText, reachedOutputLimit), ...(reachedOutputLimit ? { reachedOutputLimit } : {}) })
+
+	// manually parse out tool results if XML
+	if (!specialToolFormat) {
+		const { newOnText, newOnFinalMessage } = extractXMLToolsWrapper(onText, onFinalMessage, chatMode, mcpTools, tools)
+		onText = newOnText
+		onFinalMessage = newOnFinalMessage
+	}
+
+	// when receive text
+	let fullText = ''
+	let fullReasoning = ''
+
+	let fullToolName = ''
+	let fullToolParams = ''
+
+
+	const runOnText = () => {
+		onText({
+			fullText,
+			fullReasoning,
+			toolCall: !fullToolName ? undefined : { name: fullToolName, rawParams: {}, isDone: false, doneParams: [], id: 'dummy' },
+		})
+	}
+	// there are no events for tool_use, it comes in at the end
+	stream.on('streamEvent', e => {
+		// start block
+		if (e.type === 'content_block_start') {
+			if (e.content_block.type === 'text') {
+				if (fullText) fullText += '\n\n' // starting a 2nd text block
+				fullText += e.content_block.text
+				runOnText()
+			}
+			else if (e.content_block.type === 'thinking') {
+				if (fullReasoning) fullReasoning += '\n\n' // starting a 2nd reasoning block
+				fullReasoning += e.content_block.thinking
+				runOnText()
+			}
+			else if (e.content_block.type === 'redacted_thinking') {
+				console.log('delta', e.content_block.type)
+				if (fullReasoning) fullReasoning += '\n\n' // starting a 2nd reasoning block
+				fullReasoning += '[redacted_thinking]'
+				runOnText()
+			}
+			else if (e.content_block.type === 'tool_use') {
+				// anthropic gives us the tool name in the start block; a turn can hold several tool_use blocks, show the latest
+				fullToolName = e.content_block.name ?? ''
+				fullToolParams = ''
+				runOnText()
+			}
+		}
+
+		// delta
+		else if (e.type === 'content_block_delta') {
+			if (e.delta.type === 'text_delta') {
+				fullText += e.delta.text
+				runOnText()
+			}
+			else if (e.delta.type === 'thinking_delta') {
+				fullReasoning += e.delta.thinking
+				runOnText()
+			}
+			else if (e.delta.type === 'input_json_delta') { // tool use
+				fullToolParams += e.delta.partial_json ?? '' // anthropic gives us the partial delta (string) here - https://docs.anthropic.com/en/api/messages-streaming
+				runOnText()
+			}
+		}
+	})
+
+	// on done - (or when error/fail) - this is called AFTER last streamEvent
+	stream.on('finalMessage', (response) => {
+		// with drop_block, stale thinking blocks are dropped and listed here; worth a look if it happens every request
+		const dropped = ((response as { input_transformations?: { type?: string, reason?: string, path?: string }[] }).input_transformations ?? [])
+			.filter(t => t.type === 'thinking_dropped' && t.reason === 'prefix_binding_mismatch')
+		if (dropped.length) console.warn(`Kodia: the API dropped ${dropped.length} thinking block(s) bound to an earlier version of the conversation (first: ${dropped[0].path}).`)
+
+		const anthropicReasoning = response.content.filter(c => c.type === 'thinking' || c.type === 'redacted_thinking')
+		const toolCalls = response.content
+			.filter(c => c.type === 'tool_use')
+			.map(rawToolCallObjOfAnthropicParams)
+			.filter((t): t is RawToolCallObj => t !== null)
+
+		reachedOutputLimit = response.stop_reason === 'max_tokens'
+		onFinalMessage({ fullText, fullReasoning, anthropicReasoning, toolCalls, usage: anthropicUsage(response.usage) })
+	})
+	// on error
+	stream.on('error', (error) => {
+		if (error instanceof Anthropic.APIError && error.status === 401) { onError({ message: invalidApiKeyMessage(providerName), fullError: error }) }
+		else { onError({ message: error + '', fullError: error }) }
+	})
+	_setAborter(() => stream.controller.abort())
+}
+
+
+
+// ------------ MISTRAL ------------
+// https://docs.mistral.ai/api/#tag/fim
+const sendMistralFIM = async ({ messages, onFinalMessage, onError, settingsOfProvider, overridesOfModel, modelName: modelName_, _setAborter, providerName, promptCacheKey }: SendFIMParams_Internal) => {
+	const { modelName, supportsFIM } = getModelCapabilities(providerName, modelName_, overridesOfModel)
+	if (!supportsFIM) {
+		if (modelName === modelName_)
+			onError({ message: `Model ${modelName} does not support FIM.`, fullError: null })
+		else
+			onError({ message: `Model ${modelName_} (${modelName}) does not support FIM.`, fullError: null })
+		return
+	}
+
+	const [{ MistralCore }, { fimComplete }] = await Promise.all([import('@mistralai/mistralai/core.js'), import('@mistralai/mistralai/funcs/fimComplete.js')])
+	const mistral = new MistralCore({ apiKey: settingsOfProvider.mistral.apiKey })
+	// Autocomplete aborts the previous request on every keystroke; without this it ran to completion and was billed anyway.
+	const controller = new AbortController()
+	_setAborter(() => controller.abort())
+	fimComplete(mistral,
+		{
+			model: modelName,
+			prompt: messages.prefix,
+			suffix: messages.suffix,
+			stream: false,
+			maxTokens: 300,
+			stop: messages.stopTokens,
+			promptCacheKey, // completions in the same file share most of their prompt
+		},
+		{ signal: controller.signal })
+		.then(async response => {
+			// the SDK returns HTTP errors (and aborts) instead of throwing them
+			if (!response.ok) {
+				const { error } = response
+				const isUnauthorized = (error as { statusCode?: number }).statusCode === 401
+				onError({ message: isUnauthorized ? invalidApiKeyMessage(providerName) : error.message, fullError: error })
+				return
+			}
+			const content = response.value.choices?.[0]?.message?.content ?? ''
+			const fullText = typeof content === 'string' ? content
+				: content.map(chunk => (chunk.type === 'text' ? chunk.text : '')).join('')
+
+			onFinalMessage({ fullText, fullReasoning: '', anthropicReasoning: null });
+		})
+		.catch(error => {
+			onError({ message: error + '', fullError: error });
+		})
+}
+
+
+// ------------ OLLAMA ------------
+const newOllamaSDK = async ({ endpoint }: { endpoint: string }) => {
+	// if endpoint is empty, normally ollama will send to 11434, but we want it to fail - the user should type it in
+	if (!endpoint) throw new Error(`Ollama Endpoint was empty (please enter ${defaultProviderSettings.ollama.endpoint} in Kodia if you want the default url).`)
+	const { Ollama } = await import('ollama')
+	const ollama = new Ollama({ host: endpoint })
+	return ollama
+}
+
+const ollamaList = async ({ onSuccess: onSuccess_, onError: onError_, settingsOfProvider }: ListParams_Internal<OllamaModelResponse>) => {
+	const onSuccess = ({ models }: { models: OllamaModelResponse[] }) => {
+		onSuccess_({ models })
+	}
+	const onError = ({ error }: { error: string }) => {
+		onError_({ error })
+	}
+	try {
+		const thisConfig = settingsOfProvider.ollama
+		const ollama = await newOllamaSDK({ endpoint: thisConfig.endpoint })
+		ollama.list()
+			.then((response) => {
+				const { models } = response
+				onSuccess({ models })
+			})
+			.catch((error) => {
+				onError({ error: error + '' })
+			})
+	}
+	catch (error) {
+		onError({ error: error + '' })
+	}
+}
+
+const sendOllamaFIM = async ({ messages, onFinalMessage, onError, settingsOfProvider, modelName, _setAborter }: SendFIMParams_Internal) => {
+	const thisConfig = settingsOfProvider.ollama
+	const ollama = await newOllamaSDK({ endpoint: thisConfig.endpoint })
+
+	let fullText = ''
+	ollama.generate({
+		model: modelName,
+		prompt: messages.prefix,
+		suffix: messages.suffix,
+		options: {
+			stop: messages.stopTokens,
+			num_predict: 300, // max tokens
+			// repeat_penalty: 1,
+		},
+		raw: true,
+		stream: true, // stream is not necessary but lets us expose the
+	})
+		.then(async stream => {
+			_setAborter(() => stream.abort())
+			for await (const chunk of stream) {
+				const newText = chunk.response
+				fullText += newText
+			}
+			onFinalMessage({ fullText, fullReasoning: '', anthropicReasoning: null })
+		})
+		// when error/fail
+		.catch((error) => {
+			onError({ message: error + '', fullError: error })
+		})
+}
+
+// ---------------- GEMINI NATIVE IMPLEMENTATION ----------------
+
+const toGeminiFunctionDecl = (toolInfo: InternalToolInfo, GeminiType: typeof Type) => {
+	const { name, description } = toolInfo
+	return {
+		name,
+		description,
+		parameters: geminiParametersOfTool(toolInfo, GeminiType),
+	} satisfies FunctionDeclaration
+}
+
+const geminiTools = (chatMode: ChatMode | null, mcpTools: InternalToolInfo[] | undefined, explicitTools: InternalToolInfo[] | undefined, GeminiType: typeof Type): GeminiTool[] | null => {
+	const allowedTools = availableTools(chatMode, mcpTools, explicitTools)
+	if (!allowedTools || Object.keys(allowedTools).length === 0) return null
+	const functionDecls: FunctionDeclaration[] = []
+	for (const t in allowedTools ?? {}) {
+		functionDecls.push(toGeminiFunctionDecl(allowedTools[t], GeminiType))
+	}
+	const tools: GeminiTool = { functionDeclarations: functionDecls, }
+	return [tools]
+}
+
+
+
+// Implementation for Gemini using Google's native API
+const sendGeminiChat = async ({
+	messages,
+	separateSystemMessage,
+	onText,
+	onFinalMessage,
+	onError,
+	settingsOfProvider,
+	overridesOfModel,
+	modelName: modelName_,
+	_setAborter,
+	providerName,
+	modelSelectionOptions,
+	chatMode,
+	mcpTools,
+	tools,
+}: SendChatParams_Internal) => {
+
+	if (providerName !== 'gemini') throw new Error(`Sending Gemini chat, but provider was ${providerName}`)
+
+	const thisConfig = settingsOfProvider[providerName]
+
+	const {
+		modelName,
+		specialToolFormat,
+		// reasoningCapabilities,
+	} = getModelCapabilities(providerName, modelName_, overridesOfModel)
+
+	// const { providerReasoningIOSettings } = getProviderCapabilities(providerName)
+
+	// reasoning
+	// const { canIOReasoning, openSourceThinkTags, } = reasoningCapabilities || {}
+	const reasoningInfo = getSendableReasoningInfo('Chat', providerName, modelName_, modelSelectionOptions, overridesOfModel) // user's modelName_ here
+	// const includeInPayload = providerReasoningIOSettings?.input?.includeInPayload?.(reasoningInfo) || {}
+
+	const thinkingConfig: ThinkingConfig | undefined = !reasoningInfo?.isReasoningEnabled ? undefined
+		: reasoningInfo.type === 'budget_slider_value' ?
+			{ thinkingBudget: reasoningInfo.reasoningBudget }
+			: reasoningInfo.type === 'effort_slider_value' ?
+				{ thinkingLevel: reasoningInfo.reasoningEffort.toUpperCase() } as ThinkingConfig
+				: undefined
+
+	// tools
+	const { GoogleGenAI, Type } = await import('@google/genai')
+	const potentialTools = geminiTools(chatMode, mcpTools, tools, Type)
+	const toolConfig = potentialTools && specialToolFormat === 'gemini-style' ?
+		potentialTools
+		: undefined
+
+	// instance
+	const genAI = new GoogleGenAI({ apiKey: thisConfig.apiKey });
+
+
+	// manually parse out tool results if XML
+	if (!specialToolFormat) {
+		const { newOnText, newOnFinalMessage } = extractXMLToolsWrapper(onText, onFinalMessage, chatMode, mcpTools, tools)
+		onText = newOnText
+		onFinalMessage = newOnFinalMessage
+	}
+
+	// when receive text
+	let fullReasoningSoFar = ''
+	let fullTextSoFar = ''
+
+	// Gemini sends each function call whole, once, in the chunk where it completes
+	const streamedToolCalls: StreamedToolCall[] = []
+
+	let usage: LLMUsage | undefined
+
+	// a reply that stops at the model's output limit says so
+	let reachedOutputLimit = false
+
+
+	genAI.models.generateContentStream({
+		model: modelName,
+		config: {
+			systemInstruction: separateSystemMessage,
+			thinkingConfig: thinkingConfig,
+			tools: toolConfig,
+		},
+		contents: messages as GeminiLLMChatMessage[],
+	})
+		.then(async (stream) => {
+			_setAborter(() => { stream.return(fullTextSoFar); });
+
+			// Process the stream
+			for await (const chunk of stream) {
+				// message
+				const newText = chunk.text ?? ''
+				fullTextSoFar += newText
+				if (chunk.candidates?.[0]?.finishReason === 'MAX_TOKENS') reachedOutputLimit = true
+
+				// usage — cumulative, so the last chunk has the totals. promptTokenCount includes cached tokens.
+				const m = chunk.usageMetadata
+				if (m?.promptTokenCount !== undefined) {
+					const cacheRead = m.cachedContentTokenCount ?? 0
+					usage = { input: m.promptTokenCount - cacheRead, output: (m.candidatesTokenCount ?? 0) + (m.thoughtsTokenCount ?? 0), cacheRead }
+				}
+
+				// tool calls
+				for (const functionCall of chunk.functionCalls ?? []) {
+					streamedToolCalls.push({
+						name: functionCall.name ?? '',
+						paramsStr: JSON.stringify(functionCall.args ?? {}),
+						id: functionCall.id || generateUuid(), // ids are often empty, but other providers expect one
+					})
+				}
+
+				// (do not handle reasoning yet)
+
+				// call onText
+				onText({
+					fullText: fullTextSoFar,
+					fullReasoning: fullReasoningSoFar,
+					toolCall: streamingToolCallOf(streamedToolCalls),
+				})
+			}
+
+			// on final
+			const toolCalls = finalToolCallsOf(streamedToolCalls)
+			if (!fullTextSoFar && !fullReasoningSoFar && toolCalls.length === 0) {
+				onError({ message: 'Kodia: Response from model was empty.', fullError: null })
+			} else {
+				onFinalMessage({ fullText: withOutputLimitNotice(fullTextSoFar, reachedOutputLimit), fullReasoning: fullReasoningSoFar, anthropicReasoning: null, toolCalls, usage, ...(reachedOutputLimit ? { reachedOutputLimit } : {}) });
+			}
+		})
+		.catch(error => {
+			const message = error?.message
+			if (typeof message === 'string') {
+
+				if (error.message?.includes('API key')) {
+					onError({ message: invalidApiKeyMessage(providerName), fullError: error });
+				}
+				else if (error?.message?.includes('429')) {
+					onError({ message: 'Rate limit reached. ' + error, fullError: error });
+				}
+				else
+					onError({ message: error + '', fullError: error });
+			}
+			else {
+				onError({ message: error + '', fullError: error });
+			}
+		})
+};
+
+
+
+type CallFnOfProvider = {
+	[providerName in ProviderName]: {
+		sendChat: (params: SendChatParams_Internal) => Promise<void>;
+		sendFIM: ((params: SendFIMParams_Internal) => void) | null;
+		list: ((params: ListParams_Internal<any>) => void) | null;
+	}
+}
+
+export const sendLLMMessageToProviderImplementation = {
+	anthropic: {
+		sendChat: sendAnthropicChat,
+		sendFIM: null,
+		list: null,
+	},
+	openAI: {
+		sendChat: (params) => _sendOpenAICompatibleChat(params),
+		sendFIM: null,
+		list: null,
+	},
+	xAI: {
+		sendChat: (params) => _sendOpenAICompatibleChat(params),
+		sendFIM: null,
+		list: null,
+	},
+	gemini: {
+		sendChat: (params) => sendGeminiChat(params),
+		sendFIM: null,
+		list: null,
+	},
+	mistral: {
+		sendChat: (params) => _sendOpenAICompatibleChat(params),
+		sendFIM: (params) => sendMistralFIM(params),
+		list: null,
+	},
+	ollama: {
+		sendChat: (params) => _sendOpenAICompatibleChat(params),
+		sendFIM: sendOllamaFIM,
+		list: ollamaList,
+	},
+	openAICompatible: {
+		sendChat: (params) => _sendOpenAICompatibleChat(params), // using openai's SDK is not ideal (your implementation might not do tools, reasoning, FIM etc correctly), talk to us for a custom integration
+		sendFIM: (params) => _sendOpenAICompatibleFIM(params),
+		list: null,
+	},
+	openRouter: {
+		sendChat: (params) => _sendOpenAICompatibleChat(params),
+		sendFIM: (params) => _sendOpenAICompatibleFIM(params),
+		list: null,
+	},
+	vLLM: {
+		sendChat: (params) => _sendOpenAICompatibleChat(params),
+		sendFIM: (params) => _sendOpenAICompatibleFIM(params),
+		list: (params) => _openaiCompatibleList(params),
+	},
+	deepseek: {
+		sendChat: (params) => _sendOpenAICompatibleChat(params),
+		sendFIM: null,
+		list: null,
+	},
+	groq: {
+		sendChat: (params) => _sendOpenAICompatibleChat(params),
+		sendFIM: null,
+		list: null,
+	},
+
+	lmStudio: {
+		// lmStudio has no suffix parameter in /completions, so sendFIM might not work
+		sendChat: (params) => _sendOpenAICompatibleChat(params),
+		sendFIM: (params) => _sendOpenAICompatibleFIM(params),
+		list: (params) => _openaiCompatibleList(params),
+	},
+	mlx: {
+		sendChat: (params) => _sendOpenAICompatibleChat(params),
+		sendFIM: (params) => _sendOpenAICompatibleFIM(params),
+		list: (params) => _openaiCompatibleList(params),
+	},
+	liteLLM: {
+		sendChat: (params) => _sendOpenAICompatibleChat(params),
+		sendFIM: (params) => _sendOpenAICompatibleFIM(params),
+		list: null,
+	},
+	googleVertex: {
+		sendChat: (params) => _sendOpenAICompatibleChat(params),
+		sendFIM: null,
+		list: null,
+	},
+	microsoftAzure: {
+		sendChat: (params) => _sendOpenAICompatibleChat(params),
+		sendFIM: null,
+		list: null,
+	},
+	awsBedrock: {
+		sendChat: (params) => _sendOpenAICompatibleChat(params),
+		sendFIM: null,
+		list: null,
+	},
+	nineRouter: { // Kodia: 9Router integration
+		sendChat: (params) => _sendOpenAICompatibleChat(params),
+		sendFIM: (params) => _sendOpenAICompatibleFIM(params),
+		list: (params) => _openaiCompatibleList(params),
+	},
+
+} satisfies CallFnOfProvider
+
+
+
+
+/*
+FIM info (this may be useful in the future with vLLM, but in most cases the only way to use FIM is if the provider explicitly supports it):
+
+qwen2.5-coder https://ollama.com/library/qwen2.5-coder/blobs/e94a8ecb9327
+<|fim_prefix|>{{ .Prompt }}<|fim_suffix|>{{ .Suffix }}<|fim_middle|>
+
+codestral https://ollama.com/library/codestral/blobs/51707752a87c
+[SUFFIX]{{ .Suffix }}[PREFIX] {{ .Prompt }}
+
+deepseek-coder-v2 https://ollama.com/library/deepseek-coder-v2/blobs/22091531faf0
+<｜fim▁begin｜>{{ .Prompt }}<｜fim▁hole｜>{{ .Suffix }}<｜fim▁end｜>
+
+starcoder2 https://ollama.com/library/starcoder2/blobs/3b190e68fefe
+<file_sep>
+<fim_prefix>
+{{ .Prompt }}<fim_suffix>{{ .Suffix }}<fim_middle>
+<|end_of_text|>
+
+codegemma https://ollama.com/library/codegemma:2b/blobs/48d9a8140749
+<|fim_prefix|>{{ .Prompt }}<|fim_suffix|>{{ .Suffix }}<|fim_middle|>
+
+*/
