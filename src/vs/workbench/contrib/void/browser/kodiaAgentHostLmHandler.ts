@@ -1,0 +1,194 @@
+/*--------------------------------------------------------------------------------------
+ *  Copyright 2025 Glass Devtools, Inc. All rights reserved.
+ *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
+ *--------------------------------------------------------------------------------------*/
+
+import { CancellationToken } from '../../../../base/common/cancellation.js';
+import { Event } from '../../../../base/common/event.js';
+import { Disposable } from '../../../../base/common/lifecycle.js';
+import { InstantiationType, registerSingleton } from '../../../../platform/instantiation/common/extensions.js';
+import type { IByokLmChatDelta, IByokLmChatRequest, IByokLmChatResult, IByokLmModelInfo, IKodiaAutoApprove, IKodiaMcpTool, IKodiaMcpToolResult } from '../../../../platform/agentHost/common/agentHostByokLm.js';
+import { IKodiaAgentHostLmHandler } from '../../../../platform/agentHost/common/kodiaAgentHostLm.js';
+import { editorToolNames, isEditorToolName } from '../../../../platform/kodia/common/toolCatalog.js';
+import { appendedText, toInternalTool, toOutput, toSimpleMessages, toUsage } from '../common/kodiaAgentHostLmMessages.js';
+import { getModelCapabilities } from '../common/modelCapabilities.js';
+import { withNativeToolsForMlx } from '../common/jsonToolCall.js';
+import { toolsXMLSystemPrompt } from '../common/prompt/prompts.js';
+import { joinUserInstructions } from '../common/instructionsFrameworks.js';
+import { editorToolParams, IKodiaEditorToolsService } from '../common/kodiaEditorToolsService.js';
+import { coerceMcpArguments, mcpToolsOfServers } from '../common/kodiaMcpTools.js';
+import { IMCPService } from '../common/mcpService.js';
+import { IMlxService } from '../common/mlxService.js';
+import { prepareSimpleLLMMessages } from '../common/prepareLLMMessages.js';
+import { ILLMMessageService } from '../common/sendLLMMessageService.js';
+import { IVoidSettingsService } from '../common/voidSettingsService.js';
+import { displayInfoOfProviderName, ModelSelection, ProviderName, providerNames } from '../common/voidSettingsTypes.js';
+
+/**
+ * Serves the Kodia agent of the Agents Window with Kodia's own LLM service, so
+ * it can run every model shown in Kodia's model dropdown, whatever its
+ * provider. See {@link IKodiaAgentHostLmHandler}. Editor windows and the
+ * Agents Window both register it (see `kodiaAgentsWindow.contribution.ts`).
+ */
+class KodiaAgentHostLmHandler extends Disposable implements IKodiaAgentHostLmHandler {
+	declare readonly _serviceBrand: undefined;
+
+	readonly onDidChangeModels: Event<void>;
+
+	constructor(
+		@IVoidSettingsService private readonly _voidSettingsService: IVoidSettingsService,
+		@ILLMMessageService private readonly _llmMessageService: ILLMMessageService,
+		@IMlxService private readonly _mlxService: IMlxService,
+		@IMCPService private readonly _mcpService: IMCPService,
+		@IKodiaEditorToolsService private readonly _editorTools: IKodiaEditorToolsService,
+	) {
+		super();
+		this.onDidChangeModels = this._voidSettingsService.onDidChangeState;
+	}
+
+	// The tools of the user's MCP servers that are on: the window holds the servers, so it runs their tools for the agent.
+	async listMcpTools(): Promise<IKodiaMcpTool[]> {
+		return mcpToolsOfServers(this._mcpService.state.mcpServerOfName);
+	}
+
+	async callMcpTool(name: string, argsJson: string): Promise<IKodiaMcpToolResult> {
+		const tool = mcpToolsOfServers(this._mcpService.state.mcpServerOfName).find(t => t.name === name);
+		if (!tool) {
+			return { isError: true, output: `No MCP tool named "${name}" is available: its server may have been switched off.` };
+		}
+		let params: Record<string, unknown>;
+		try {
+			const parsed = argsJson ? JSON.parse(argsJson) : {};
+			params = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+		} catch {
+			return { isError: true, output: `Invalid JSON arguments for tool "${tool.displayName}".` };
+		}
+		try {
+			const { result } = await this._mcpService.callMCPTool({ serverName: tool.serverName, toolName: name, params: coerceMcpArguments(tool.inputSchema, params) });
+			return { isError: false, output: this._mcpService.stringifyResult(result) };
+		} catch (err) {
+			return { isError: true, output: err instanceof Error ? err.message : String(err) };
+		}
+	}
+
+	// The language server's tools and the lint errors: an editor window runs them, as its chat does. The Agents Window has
+	// no editor, so it offers none and the agent asks another window.
+	async listEditorTools(): Promise<string[]> {
+		return this._editorTools.tools ? [...editorToolNames] : [];
+	}
+
+	async callEditorTool(name: string, argsJson: string): Promise<IKodiaMcpToolResult> {
+		const tools = this._editorTools.tools;
+		if (!tools) {
+			return { isError: true, output: `"${name}" needs an editor window, and this window has none.` };
+		}
+		if (!isEditorToolName(name)) {
+			return { isError: true, output: `No editor tool named "${name}".` };
+		}
+		const params = editorToolParams(argsJson);
+		if (!params) {
+			return { isError: true, output: `Invalid JSON arguments for tool "${name}".` };
+		}
+		return tools.call(name, params);
+	}
+
+	// What the user switched on in Kodia's settings ("Auto-approve"), as the chat honors it: the agent asks about the rest.
+	async getAutoApprove(): Promise<IKodiaAutoApprove> {
+		await this._voidSettingsService.waitForInitState;
+		const { autoApprove } = this._voidSettingsService.state.globalSettings;
+		return {
+			edits: autoApprove.edits === true,
+			terminal: autoApprove.terminal === true,
+			'web pages': autoApprove['web pages'] === true,
+			'MCP tools': autoApprove['MCP tools'] === true,
+		};
+	}
+
+	async listModels(): Promise<IByokLmModelInfo[]> {
+		await this._voidSettingsService.waitForInitState;
+		// `_modelOptions` is every model switched on for a provider that is set up
+		// ("Show in Dropdown" in Kodia settings): Gemini, MLX, OpenRouter, and the rest.
+		const { _modelOptions, overridesOfModel } = this._voidSettingsService.state;
+		return _modelOptions.map(({ name, selection: { providerName, modelName } }) => {
+			const { contextWindow, supportsVision } = getModelCapabilities(providerName, modelName, overridesOfModel);
+			const providerTitle = displayInfoOfProviderName(providerName).title;
+			const label = name.includes(providerTitle) ? name : `${providerTitle} · ${name}`;
+			return { vendor: providerName, id: modelName, name: label, maxContextWindowTokens: contextWindow, supportsVision: !!supportsVision };
+		});
+	}
+
+	async chat(request: IByokLmChatRequest, token: CancellationToken): Promise<IByokLmChatResult> {
+		return this.chatStream(request, () => { }, token);
+	}
+
+	// `onText` of Kodia's LLM service holds the whole text and reasoning so far: the agent is sent what each adds.
+	async chatStream(request: IByokLmChatRequest, onDelta: (delta: IByokLmChatDelta) => void, token: CancellationToken): Promise<IByokLmChatResult> {
+		if (!(providerNames as readonly string[]).includes(request.vendor)) {
+			return { output: [], error: `Unknown Kodia provider: ${request.vendor}` };
+		}
+		const modelSelection: ModelSelection = { providerName: request.vendor as ProviderName, modelName: request.modelId };
+		// An editor window starts Kodia's MLX server; the Agents Window may be the only window open.
+		if (modelSelection.providerName === 'mlx' && this._voidSettingsService.state.globalSettings.autoSetupMlx) {
+			await this._mlxService.ensureReady({ installIfMissing: false, startServer: true }).catch(() => undefined);
+		}
+		const { overridesOfModel: settingsOverrides, optionsOfModelSelection, globalSettings } = this._voidSettingsService.state;
+		// a local MLX model with no tool format of its own is offered the tools natively (its calls come back as JSON)
+		const overridesOfModel = withNativeToolsForMlx(modelSelection, settingsOverrides);
+		const tools = request.tools?.flatMap(toInternalTool) ?? [];
+		// Models without native tool calling are taught the XML format in the system message.
+		const { specialToolFormat } = getModelCapabilities(modelSelection.providerName, modelSelection.modelName, overridesOfModel);
+		const systemMessage = [request.instructions, specialToolFormat ? null : toolsXMLSystemPrompt(tools)].filter(Boolean).join('\n\n');
+		const { messages, separateSystemMessage } = prepareSimpleLLMMessages({
+			simpleMessages: toSimpleMessages(request.input),
+			systemMessage,
+			// The agent works on its session's folder, not on an editor window's workspace, whose rules and memory don't apply.
+			// A sub-agent only reads: it is sent the user's own instructions, without the frameworks.
+			aiInstructions: joinUserInstructions(globalSettings.aiInstructions, request.withoutFrameworks ? [] : globalSettings.instructionsFrameworks),
+			modelSelection,
+			featureName: 'Chat',
+			overridesOfModel,
+			optionsOfModelSelection,
+		});
+
+		return new Promise<IByokLmChatResult>(resolve => {
+			let requestId: string | null = null;
+			let sentText = '';
+			let sentReasoning = '';
+			const cancellation = token.onCancellationRequested(() => {
+				if (requestId) {
+					this._llmMessageService.abort(requestId);
+				}
+			});
+			const settle = (result: IByokLmChatResult) => {
+				cancellation.dispose();
+				resolve(result);
+			};
+			requestId = this._llmMessageService.sendLLMMessage({
+				messagesType: 'chatMessages',
+				messages,
+				separateSystemMessage,
+				// Agent mode, with exactly the agent's own tools (it runs them itself).
+				chatMode: 'agent',
+				tools,
+				modelSelection,
+				modelSelectionOptions: optionsOfModelSelection.Chat[modelSelection.providerName]?.[modelSelection.modelName],
+				overridesOfModel,
+				logging: { loggingName: 'Agents Window' },
+				onText: ({ fullText, fullReasoning }) => {
+					const text = appendedText(sentText, fullText);
+					const reasoning = appendedText(sentReasoning, fullReasoning);
+					if (text || reasoning) {
+						sentText += text;
+						sentReasoning += reasoning;
+						onDelta({ ...text ? { text } : {}, ...reasoning ? { reasoning } : {} });
+					}
+				},
+				onFinalMessage: final => settle({ output: toOutput(final), usage: toUsage(final.usage), ...(final.reachedOutputLimit ? { reachedOutputLimit: true } : {}) }),
+				onError: ({ message }) => settle({ output: [], error: message }),
+				onAbort: () => settle({ output: [], error: 'Cancelled' }),
+			});
+		});
+	}
+}
+
+registerSingleton(IKodiaAgentHostLmHandler, KodiaAgentHostLmHandler, InstantiationType.Delayed);

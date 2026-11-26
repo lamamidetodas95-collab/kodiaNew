@@ -1,0 +1,120 @@
+import { URI } from '../../../../base/common/uri.js'
+import { RawMCPToolCall } from './mcpServiceTypes.js';
+import { builtinTools } from './prompt/prompts.js';
+import { RawToolParamsObj } from './sendLLMMessageTypes.js';
+
+
+
+export type TerminalResolveReason = { type: 'timeout' } | { type: 'done', exitCode: number }
+
+export type LintErrorItem = { code: string, message: string, startLineNumber: number, endLineNumber: number }
+
+// a place in the code, with the text there (the LLM can pass uri + line straight back to other tools)
+export type CodeLocation = { uri: URI, line: number, snippet: string }
+
+export type WorkspaceSymbolEntry = { name: string, kind: string, containerName: string | undefined, uri: URI, line: number | undefined }
+
+// Partial of IFileStat
+export type ShallowDirectoryItem = {
+	uri: URI;
+	name: string;
+	isDirectory: boolean;
+	isSymbolicLink: boolean;
+}
+
+
+export const approvalTypeOfBuiltinToolName: Partial<{ [T in BuiltinToolName]?: 'edits' | 'terminal' | 'web pages' | 'MCP tools' }> = {
+	'create_file_or_folder': 'edits',
+	'delete_file_or_folder': 'edits',
+	'rewrite_file': 'edits',
+	'edit_file': 'edits',
+	'write_project_memory': 'edits',
+	'run_command': 'terminal',
+	'run_persistent_command': 'terminal',
+	'open_persistent_terminal': 'terminal',
+	'kill_persistent_terminal': 'terminal',
+	// a fetched URL can carry data out of the workspace, so the user sees it first
+	'fetch_url': 'web pages',
+}
+
+
+export type ToolApprovalType = NonNullable<(typeof approvalTypeOfBuiltinToolName)[keyof typeof approvalTypeOfBuiltinToolName]>;
+
+
+export const toolApprovalTypes = new Set<ToolApprovalType>([
+	...Object.values(approvalTypeOfBuiltinToolName),
+	'MCP tools',
+])
+
+
+
+
+// PARAMS OF TOOL CALL
+export type BuiltinToolCallParams = {
+	'read_file': { uri: URI, startLine: number | null, endLine: number | null, pageNumber: number },
+	'ls_dir': { uri: URI, pageNumber: number },
+	'get_dir_tree': { uri: URI },
+	'search_pathnames_only': { query: string, includePattern: string | null, pageNumber: number },
+	'search_for_files': { query: string, isRegex: boolean, searchInFolder: URI | null, pageNumber: number },
+	'search_codebase': { query: string, searchInFolder: URI | null },
+	'search_in_file': { uri: URI, query: string, isRegex: boolean },
+	'go_to_definition': { uri: URI, line: number, symbol: string },
+	'find_references': { uri: URI, line: number, symbol: string },
+	'search_symbols': { query: string },
+	'read_lint_errors': { uri: URI },
+	'read_project_memory': {},
+	'fetch_url': { url: string, pageNumber: number },
+	// ---
+	'rewrite_file': { uri: URI, newContent: string },
+	'write_project_memory': { section: string, content: string },
+	'edit_file': { uri: URI, searchReplaceBlocks: string },
+	'create_file_or_folder': { uri: URI, isFolder: boolean },
+	'delete_file_or_folder': { uri: URI, isRecursive: boolean, isFolder: boolean },
+	// ---
+	'run_command': { command: string; cwd: string | null, terminalId: string },
+	'open_persistent_terminal': { cwd: string | null },
+	'run_persistent_command': { command: string; persistentTerminalId: string },
+	'kill_persistent_terminal': { persistentTerminalId: string },
+}
+
+// RESULT OF TOOL CALL
+export type BuiltinToolResultType = {
+	'read_file': { fileContents: string, totalFileLen: number, totalNumLines: number, hasNextPage: boolean },
+	'ls_dir': { children: ShallowDirectoryItem[] | null, hasNextPage: boolean, hasPrevPage: boolean, itemsRemaining: number },
+	'get_dir_tree': { str: string, },
+	'search_pathnames_only': { uris: URI[], hasNextPage: boolean },
+	'search_for_files': { uris: URI[], hasNextPage: boolean },
+	'search_codebase': { passages: { uri: URI, startLine: number, endLine: number, text: string }[] },
+	'search_in_file': { lines: number[]; },
+	// hasLanguageServer: false when no language server answers this request for the file / workspace
+	'go_to_definition': { locations: CodeLocation[], hasLanguageServer: boolean },
+	'find_references': { locations: CodeLocation[], totalCount: number, hasLanguageServer: boolean },
+	'search_symbols': { symbols: WorkspaceSymbolEntry[], totalCount: number, hasLanguageServer: boolean },
+	'read_lint_errors': { lintErrors: LintErrorItem[] | null },
+	'read_project_memory': { content: string },
+	// url: where redirects ended
+	'fetch_url': { url: string, title: string | null, content: string, totalLen: number, hasNextPage: boolean },
+	// ---
+	'rewrite_file': Promise<{ lintErrors: LintErrorItem[] | null }>,
+	'edit_file': Promise<{ lintErrors: LintErrorItem[] | null }>,
+	'write_project_memory': { content: string, tokenCount: number },
+	'create_file_or_folder': {},
+	'delete_file_or_folder': {},
+	// ---
+	'run_command': { result: string; resolveReason: TerminalResolveReason; },
+	'run_persistent_command': { result: string; resolveReason: TerminalResolveReason; },
+	'open_persistent_terminal': { persistentTerminalId: string },
+	'kill_persistent_terminal': {},
+}
+
+
+export type ToolCallParams<T extends BuiltinToolName | (string & {})> = T extends BuiltinToolName ? BuiltinToolCallParams[T] : RawToolParamsObj
+export type ToolResult<T extends BuiltinToolName | (string & {})> = T extends BuiltinToolName ? BuiltinToolResultType[T] : RawMCPToolCall
+
+export type BuiltinToolName = keyof BuiltinToolResultType
+
+type BuiltinToolParamNameOfTool<T extends BuiltinToolName> = keyof (typeof builtinTools)[T]['params']
+
+
+export type ToolName = BuiltinToolName | (string & {})
+export type ToolParamName<T extends ToolName> = T extends BuiltinToolName ? BuiltinToolParamNameOfTool<T> : string

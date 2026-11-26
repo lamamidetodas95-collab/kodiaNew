@@ -1,0 +1,103 @@
+/*--------------------------------------------------------------------------------------
+ *  Copyright 2025 Glass Devtools, Inc. All rights reserved.
+ *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
+ *--------------------------------------------------------------------------------------*/
+
+
+// register inline diffs
+import './editCodeService.js'
+
+// register Sidebar pane, state, actions (keybinds, menus) (Ctrl+L)
+import './sidebarActions.js'
+import './sidebarPane.js'
+
+// register quick edit (Ctrl+K)
+import './quickEditActions.js'
+
+
+// register Autocomplete
+import './autocompleteService.js'
+
+// settings pane
+import './voidSettingsPane.js'
+
+// register css
+import './media/void.css'
+
+// update (frontend part, also see platform/)
+import './voidUpdateActions.js'
+
+import './convertToLLMMessageWorkbenchContrib.js'
+
+// tools
+import './toolsService.js'
+import './terminalToolService.js'
+
+// register Thread History
+import './chatThreadService.js'
+
+// ping
+import './metricsPollService.js'
+
+// helper services
+import './helperServices/consistentItemService.js'
+
+// register selection helper
+import './voidSelectionHelperWidget.js'
+
+// register tooltip service
+import './tooltipService.js'
+
+// register onboarding service
+import './voidOnboardingService.js'
+
+// auto-bootstrap project memory on first workspace open
+import './projectMemoryBootstrapContrib.js'
+
+// disable built-in GitHub Copilot extension and sign-in UI
+import './disableCopilotContribution.js'
+
+// register misc service
+import './miscWokrbenchContrib.js'
+
+// register file service (for explorer context menu)
+import './fileService.js'
+
+// register source control management
+import './voidSCMService.js'
+
+// ---------- common (unclear if these actually need to be imported, because they're already imported wherever they're used) ----------
+
+// llmMessage
+import '../common/sendLLMMessageService.js'
+
+// voidSettings
+import '../common/voidSettingsService.js'
+
+// refreshModel
+import '../common/refreshModelService.js'
+
+// MLX (macOS): auto-install mlx-lm + start mlx_lm.server
+import '../common/mlxService.js'
+import './mlxWorkbenchContrib.js'
+
+// the models providers' APIs list that Kodia's catalog doesn't have (OpenRouter's free models), detected daily
+import './providerModelsContrib.js'
+
+// Agents Window: the Kodia agent runs every model shown in Kodia's model dropdown
+import './kodiaAgentHostLmHandler.js'
+
+// metrics
+import '../common/metricsService.js'
+
+// updates
+import '../common/voidUpdateService.js'
+
+// model service
+import '../common/voidModelService.js'
+
+// project memory (.kodia/memory.md)
+import '../common/projectMemoryService.js'
+
+// agent skills: .kodia/skills next to the chat's skill folders
+import '../common/agentSkills.js'

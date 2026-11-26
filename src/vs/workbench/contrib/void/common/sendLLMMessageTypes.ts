@@ -1,0 +1,250 @@
+/*--------------------------------------------------------------------------------------
+ *  Copyright 2025 Glass Devtools, Inc. All rights reserved.
+ *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
+ *--------------------------------------------------------------------------------------*/
+
+import { InternalToolInfo } from './prompt/prompts.js'
+import { ToolName, ToolParamName } from './toolsServiceTypes.js'
+import { ChatMode, ModelSelection, ModelSelectionOptions, OverridesOfModel, ProviderName, RefreshableProviderName, SettingsOfProvider } from './voidSettingsTypes.js'
+
+
+export const errorDetails = (fullError: Error | null): string | null => {
+	if (fullError === null) {
+		return null
+	}
+	else if (typeof fullError === 'object') {
+		if (Object.keys(fullError).length === 0) return null
+		return JSON.stringify(fullError, null, 2)
+	}
+	else if (typeof fullError === 'string') {
+		return null
+	}
+	return null
+}
+
+export const getErrorMessage: (error: unknown) => string = (error) => {
+	if (error instanceof Error) return `${error.name}: ${error.message}`
+	return error + ''
+}
+
+
+
+export type AnthropicImageBlock = { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
+export type OpenAIImagePart = { type: 'image_url'; image_url: { url: string } }
+// PDFs: Anthropic document blocks, OpenAI-compatible file parts (data URL), Mistral document_url chunks (data URL);
+// Gemini converts from the Anthropic block
+export type AnthropicDocumentBlock = { type: 'document'; source: { type: 'base64'; media_type: 'application/pdf'; data: string }; title?: string }
+export type OpenAIFilePart = { type: 'file'; file: { filename: string; file_data: string } }
+export type MistralDocumentPart = { type: 'document_url'; document_url: string; document_name?: string }
+
+export type AnthropicLLMChatMessage = {
+	role: 'assistant',
+	content: string | (AnthropicReasoning | { type: 'text'; text: string }
+		| { type: 'tool_use'; name: string; input: Record<string, any>; id: string; }
+	)[];
+} | {
+	role: 'user',
+	content: string | (
+		{ type: 'text'; text: string; } | { type: 'tool_result'; tool_use_id: string; content: string; } | AnthropicImageBlock | AnthropicDocumentBlock
+	)[]
+} | {
+	role: 'system', // mid-conversation system message, on the Claude models that accept one (anthropicModelFeatures)
+	content: string,
+}
+export type OpenAILLMChatMessage = {
+	role: 'system' | 'developer';
+	content: string;
+} | {
+	role: 'user';
+	content: string | ({ type: 'text'; text: string } | OpenAIImagePart | OpenAIFilePart | MistralDocumentPart)[];
+} | {
+	role: 'assistant',
+	content: string | (AnthropicReasoning | { type: 'text'; text: string })[];
+	tool_calls?: { type: 'function'; id: string; function: { name: string; arguments: string; } }[];
+} | {
+	role: 'tool',
+	content: string;
+	tool_call_id: string;
+}
+
+export type GeminiLLMChatMessage = {
+	role: 'model'
+	parts: (
+		| { text: string; }
+		| { functionCall: { id: string; name: ToolName, args: Record<string, unknown> } }
+	)[];
+} | {
+	role: 'user';
+	parts: (
+		| { text: string; }
+		| { inlineData: { mimeType: string; data: string } }
+		| { functionResponse: { id: string; name: ToolName, response: { output: string } } }
+	)[];
+}
+
+export type LLMChatMessage = AnthropicLLMChatMessage | OpenAILLMChatMessage | GeminiLLMChatMessage
+
+
+
+export type LLMFIMMessage = {
+	prefix: string;
+	suffix: string;
+	stopTokens: string[];
+}
+
+
+export type RawToolParamsObj = {
+	[paramName in ToolParamName<ToolName>]?: string;
+}
+export type RawToolCallObj = {
+	name: ToolName;
+	rawParams: RawToolParamsObj;
+	doneParams: ToolParamName<ToolName>[];
+	id: string;
+	isDone: boolean;
+};
+
+export type AnthropicReasoning = ({ type: 'thinking'; thinking: any; signature: string; } | { type: 'redacted_thinking', data: any })
+
+// Token counts for one LLM request, normalized across providers so that each bucket is billed at
+// exactly one rate: `input` excludes cached tokens, `output` includes reasoning tokens.
+export type LLMUsage = {
+	input: number;
+	output: number;
+	cacheRead?: number;
+	cacheWrite?: number;
+}
+
+// toolCall: the call currently being streamed (the latest one, when a turn makes several) — for display only
+export type OnText = (p: { fullText: string; fullReasoning: string; toolCall?: RawToolCallObj }) => void
+// toolCalls: every call of the turn, in the order the model made them (models can call several tools at once)
+// reachedOutputLimit: the model stopped at its output limit, in the middle of its reply: the chat offers to continue it
+export type OnFinalMessage = (p: { fullText: string; fullReasoning: string; toolCalls?: RawToolCallObj[]; anthropicReasoning: AnthropicReasoning[] | null; usage?: LLMUsage; reachedOutputLimit?: boolean }) => void // id is tool_use_id
+export type OnError = (p: { message: string; fullError: Error | null }) => void
+export type OnAbort = () => void
+export type AbortRef = { current: (() => void) | null }
+
+
+// service types
+type SendLLMType = {
+	messagesType: 'chatMessages';
+	messages: LLMChatMessage[]; // the type of raw chat messages that we send to Anthropic, OAI, etc
+	separateSystemMessage: string | undefined;
+	chatMode: ChatMode | null;
+	promptCacheKey?: string; // the same for requests sharing a prefix (e.g. a thread's agent loop), to help provider-side prompt caching
+	promptCacheTTL?: '1h'; // Anthropic: keep the prompt cache 1 hour instead of 5 minutes
+	prediction?: string; // the output we expect (e.g. the code being rewritten), sent only to models with supportsPredictedOutputs
+	tools?: InternalToolInfo[]; // Kodia Agents Window: exactly these tools instead of the chat mode's (the agent runs them itself)
+} | {
+	messagesType: 'FIMMessage';
+	messages: LLMFIMMessage;
+	separateSystemMessage?: undefined;
+	chatMode?: undefined;
+	promptCacheKey?: string; // the same for completions in one file (Mistral only)
+	promptCacheTTL?: undefined;
+	prediction?: undefined;
+	tools?: undefined;
+}
+export type ServiceSendLLMMessageParams = {
+	onText: OnText;
+	onFinalMessage: OnFinalMessage;
+	onError: OnError;
+	logging: { loggingName: string, loggingExtras?: { [k: string]: any } };
+	modelSelection: ModelSelection | null;
+	modelSelectionOptions: ModelSelectionOptions | undefined;
+	overridesOfModel: OverridesOfModel | undefined;
+	onAbort: OnAbort;
+} & SendLLMType;
+
+// params to the true sendLLMMessage function
+export type SendLLMMessageParams = {
+	onText: OnText;
+	onFinalMessage: OnFinalMessage;
+	onError: OnError;
+	logging: { loggingName: string, loggingExtras?: { [k: string]: any } };
+	abortRef: AbortRef;
+
+	modelSelection: ModelSelection;
+	modelSelectionOptions: ModelSelectionOptions | undefined;
+	overridesOfModel: OverridesOfModel | undefined;
+
+	settingsOfProvider: SettingsOfProvider;
+	mcpTools: InternalToolInfo[] | undefined;
+} & SendLLMType
+
+
+
+// can't send functions across a proxy, use listeners instead
+export type BlockedMainLLMMessageParams = 'onText' | 'onFinalMessage' | 'onError' | 'abortRef'
+export type MainSendLLMMessageParams = Omit<SendLLMMessageParams, BlockedMainLLMMessageParams> & { requestId: string } & SendLLMType
+
+export type MainLLMMessageAbortParams = { requestId: string }
+
+export type EventLLMMessageOnTextParams = Parameters<OnText>[0] & { requestId: string }
+export type EventLLMMessageOnFinalMessageParams = Parameters<OnFinalMessage>[0] & { requestId: string }
+export type EventLLMMessageOnErrorParams = Parameters<OnError>[0] & { requestId: string }
+
+// service -> main -> internal -> event (back to main)
+// (browser)
+
+
+
+
+
+
+
+
+
+// These are from 'ollama' SDK
+interface OllamaModelDetails {
+	parent_model: string;
+	format: string;
+	family: string;
+	families: string[];
+	parameter_size: string;
+	quantization_level: string;
+}
+
+export type OllamaModelResponse = {
+	name: string;
+	modified_at: Date;
+	size: number;
+	digest: string;
+	details: OllamaModelDetails;
+	expires_at: Date;
+	size_vram: number;
+}
+
+export type OpenaiCompatibleModelResponse = {
+	id: string;
+	created: number;
+	object: 'model';
+	owned_by: string;
+}
+
+
+
+// params to the true list fn
+export type ModelListParams<ModelResponse> = {
+	providerName: ProviderName;
+	settingsOfProvider: SettingsOfProvider;
+	onSuccess: (param: { models: ModelResponse[] }) => void;
+	onError: (param: { error: string }) => void;
+}
+
+// params to the service
+export type ServiceModelListParams<modelResponse> = {
+	providerName: RefreshableProviderName;
+	onSuccess: (param: { models: modelResponse[] }) => void;
+	onError: (param: { error: any }) => void;
+}
+
+type BlockedMainModelListParams = 'onSuccess' | 'onError'
+export type MainModelListParams<modelResponse> = Omit<ModelListParams<modelResponse>, BlockedMainModelListParams> & { providerName: RefreshableProviderName, requestId: string }
+
+export type EventModelListOnSuccessParams<modelResponse> = Parameters<ModelListParams<modelResponse>['onSuccess']>[0] & { requestId: string }
+export type EventModelListOnErrorParams<modelResponse> = Parameters<ModelListParams<modelResponse>['onError']>[0] & { requestId: string }
+
+
+
+

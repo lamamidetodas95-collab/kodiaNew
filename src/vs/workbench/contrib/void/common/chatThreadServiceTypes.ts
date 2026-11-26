@@ -1,0 +1,162 @@
+/*--------------------------------------------------------------------------------------
+ *  Copyright 2025 Glass Devtools, Inc. All rights reserved.
+ *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
+ *--------------------------------------------------------------------------------------*/
+
+import { URI } from '../../../../base/common/uri.js';
+import { VoidFileSnapshot } from './editCodeServiceTypes.js';
+import { AnthropicReasoning, LLMUsage, RawToolParamsObj } from './sendLLMMessageTypes.js';
+import { ToolCallParams, ToolName, ToolResult } from './toolsServiceTypes.js';
+import { ModelSelection } from './voidSettingsTypes.js';
+
+export type ToolMessage<T extends ToolName> = {
+	role: 'tool';
+	content: string; // give this result to LLM (string of value)
+	id: string;
+	rawParams: RawToolParamsObj;
+	mcpServerName: string | undefined; // the server name at the time of the call
+} & (
+		// in order of events:
+		| { type: 'invalid_params', result: null, name: T, }
+
+		| { type: 'tool_request', result: null, name: T, params: ToolCallParams<T>, }  // params were validated, awaiting user
+
+		| { type: 'running_now', result: null, name: T, params: ToolCallParams<T>, }
+
+		| { type: 'tool_error', result: string, name: T, params: ToolCallParams<T>, } // error when tool was running
+		| { type: 'success', result: Awaited<ToolResult<T>>, name: T, params: ToolCallParams<T>, }
+		| { type: 'rejected', result: null, name: T, params: ToolCallParams<T> }
+	) // user rejected
+
+export type DecorativeCanceledTool = {
+	role: 'interrupted_streaming_tool';
+	name: ToolName;
+	mcpServerName: string | undefined; // the server name at the time of the call
+}
+
+
+// checkpoints
+export type CheckpointEntry = {
+	role: 'checkpoint';
+	type: 'user_edit' | 'tool_edit';
+	voidFileSnapshotOfURI: { [fsPath: string]: VoidFileSnapshot | undefined };
+
+	userModifications: {
+		voidFileSnapshotOfURI: { [fsPath: string]: VoidFileSnapshot | undefined };
+	};
+}
+
+
+// Appended when the thread outgrew the model's context window: from then on, the results of tool calls before
+// keepFromIdx (the user message that was the latest then) go to the model as a short stub. A one-time change to
+// the history, instead of truncating messages on every request (which voids the prompt cache each time).
+export type ContextClearedEntry = {
+	role: 'context_cleared';
+	keepFromIdx: number;
+}
+
+// Appended when the thread still didn't fit after clearing old tool results: from then on, the messages before
+// keepFromIdx (a user or assistant message) go to the model as this summary, written by the chat model itself.
+// What was decided survives, instead of the oldest messages being cut on every request.
+export type ContextSummaryEntry = {
+	role: 'context_summary';
+	summary: string;
+	keepFromIdx: number;
+}
+
+
+// WARNING: changing this format is a big deal!!!!!! need to migrate old format to new format on users' computers so people don't get errors.
+export type ChatMessage =
+	| {
+		role: 'user';
+		content: string; // content displayed to the LLM on future calls - allowed to be '', will be replaced with (empty)
+		displayContent: string; // content displayed to user  - allowed to be '', will be ignored
+		selections: StagingSelectionItem[] | null; // the user's selection
+		state: {
+			stagingSelections: StagingSelectionItem[];
+			isBeingEdited: boolean;
+		}
+	} | {
+		role: 'assistant';
+		displayContent: string; // content received from LLM  - allowed to be '', will be replaced with (empty)
+		reasoning: string; // reasoning from the LLM, used for step-by-step thinking
+
+		anthropicReasoning: AnthropicReasoning[] | null; // anthropic reasoning
+
+		// both optional: absent on messages stored before they existed
+		modelSelection?: ModelSelection; // the model that produced this message — its anthropicReasoning signatures are only valid for that model
+		usage?: LLMUsage; // tokens of the request that produced this message
+		reachedOutputLimit?: true; // the model stopped at its output limit, in the middle of this reply: the chat offers to continue it
+	}
+	| ToolMessage<ToolName>
+	| DecorativeCanceledTool
+	| CheckpointEntry
+	| ContextClearedEntry
+	| ContextSummaryEntry
+
+
+// one of the square items that indicates a selection in a chat bubble
+export type StagingSelectionItem = {
+	type: 'File';
+	uri: URI;
+	language: string;
+	state: { wasAddedAsCurrentFile: boolean; };
+} | {
+	type: 'CodeSelection';
+	range: [number, number];
+	uri: URI;
+	language: string;
+	state: { wasAddedAsCurrentFile: boolean; };
+} | {
+	type: 'Folder';
+	uri: URI;
+	language?: undefined;
+	state?: undefined;
+} | {
+	// pasted or dropped into the chat; sent to the model as an image, not as text
+	type: 'Image';
+	id: string;
+	name: string;
+	mimeType: ChatImageMimeType;
+	dataBase64: string;
+	uri?: undefined;
+	language?: undefined;
+	state?: undefined;
+} | {
+	// attached with the + button or dropped in; sent as a document to models that read PDFs (supportsPDF)
+	type: 'PDF';
+	id: string;
+	name: string;
+	dataBase64: string;
+	pageCount: number; // estimated when attached, for the context budget
+	uri?: undefined;
+	language?: undefined;
+	state?: undefined;
+} | {
+	// a text or code file attached from anywhere (not a workspace file); its content goes into the message as text
+	type: 'TextFile';
+	id: string;
+	name: string;
+	languageId: string; // for the code fence
+	text: string;
+	uri?: undefined;
+	language?: undefined;
+	state?: undefined;
+}
+
+// the image types every vision-capable provider accepts (Anthropic, OpenAI, Gemini)
+export const chatImageMimeTypes = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'] as const
+export type ChatImageMimeType = typeof chatImageMimeTypes[number]
+
+
+// a link to a symbol (an underlined link to a piece of code)
+export type CodespanLocationLink = {
+	uri: URI, // we handle serialization for this
+	displayText: string,
+	selection?: { // store as JSON so dont have to worry about serialization
+		startLineNumber: number
+		startColumn: number,
+		endLineNumber: number
+		endColumn: number,
+	} | undefined
+} | null
