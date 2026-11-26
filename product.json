@@ -1,0 +1,111 @@
+{
+	"nameShort": "Kodia",
+	"nameLong": "Kodia",
+	"voidVersion": "2.0.0",
+	"voidRelease": "1000",
+	"applicationName": "kodia",
+	"dataFolderName": ".kodia",
+	"win32MutexName": "kodia",
+	"licenseName": "Apache-2.0",
+	"licenseUrl": "https://github.com/jcommaret/kodia/blob/master/LICENSE.txt",
+	"serverLicenseUrl": "https://github.com/jcommaret/kodia/blob/master/LICENSE.txt",
+	"serverGreeting": [],
+	"serverLicense": [],
+	"serverLicensePrompt": "",
+	"serverApplicationName": "kodia-server",
+	"serverDataFolderName": ".kodia-server",
+	"tunnelApplicationName": "kodia-tunnel",
+	"win32DirName": "Kodia",
+	"win32NameVersion": "Kodia",
+	"win32RegValueName": "Kodia",
+	"win32x64AppId": "{{ED9151CA-D9C1-41D3-9434-D5964DC7FA07}",
+	"win32arm64AppId": "{{86DEDBE9-E31B-4C86-A8AF-3DC39E4A438E}",
+	"win32x64UserAppId": "{{7493FC1F-DF0E-4FCC-AAF1-1EB0485BDA27}",
+	"win32arm64UserAppId": "{{9A425148-B9DF-4DDF-87CF-5D8D3FD0229F}",
+	"win32AppUserModelId": "Kodia.Kodia",
+	"win32ShellNameShort": "K&odia",
+	"win32TunnelServiceMutex": "kodia-tunnelservice",
+	"win32TunnelMutex": "kodia-tunnel",
+	"darwinBundleIdentifier": "com.jcommaret.kodia",
+	"linuxIconName": "kodia",
+	"licenseFileName": "LICENSE.txt",
+	"reportIssueUrl": "https://github.com/jcommaret/kodia/issues/new",
+	"urlProtocol": "kodia",
+	"extensionsGallery": {
+		"serviceUrl": "https://marketplace.visualstudio.com/_apis/public/gallery",
+		"itemUrl": "https://marketplace.visualstudio.com/items",
+		"publisherUrl": "https://marketplace.visualstudio.com/publishers",
+		"resourceUrlTemplate": "https://{publisher}.vscode-unpkg.net/{publisher}/{name}/{version}/{path}",
+		"controlUrl": "https://az764295.vo.msecnd.net/extensions/marketplace.json",
+		"nlsBaseUrl": "https://download.visualstudio.microsoft.com/download/pr/",
+		"extensionUrlTemplate": "https://marketplace.visualstudio.com/items?itemName={publisher}.{name}"
+	},
+	"builtInExtensions": [],
+	"linkProtectionTrustedDomains": [
+		"https://github.com/jcommaret/kodia",
+		"https://ollama.com"
+	],
+	"sharedDataFolderName": ".kodia-shared",
+	"defaultChatAgent": {
+		"extensionId": "void.void",
+		"chatExtensionId": "void.void",
+		"chatExtensionOutputId": "",
+		"chatExtensionOutputExtensionStateCommand": "",
+		"documentationUrl": "https://github.com/jcommaret/kodia",
+		"skusDocumentationUrl": "https://github.com/jcommaret/kodia",
+		"publicCodeMatchesUrl": "https://github.com/jcommaret/kodia",
+		"managePlanUrl": "https://github.com/jcommaret/kodia",
+		"upgradePlanUrl": "https://github.com/jcommaret/kodia",
+		"signUpUrl": "https://github.com/jcommaret/kodia",
+		"termsStatementUrl": "https://github.com/jcommaret/kodia",
+		"privacyStatementUrl": "https://github.com/jcommaret/kodia",
+		"provider": {
+			"default": {
+				"id": "void",
+				"name": "Void"
+			},
+			"enterprise": {
+				"id": "void",
+				"name": "Void"
+			},
+			"google": {
+				"id": "void",
+				"name": "Void"
+			},
+			"apple": {
+				"id": "void",
+				"name": "Void"
+			},
+			"microsoft": {
+				"id": "microsoft",
+				"name": "Microsoft"
+			}
+		},
+		"providerExtensionId": "void.void",
+		"providerUriSetting": "",
+		"providerScopes": [],
+		"entitlementUrl": "https://github.com/jcommaret/kodia",
+		"entitlementSignupLimitedUrl": "https://github.com/jcommaret/kodia",
+		"tokenEntitlementUrl": "https://github.com/jcommaret/kodia",
+		"mcpRegistryDataUrl": "https://github.com/jcommaret/kodia",
+		"chatQuotaExceededContext": "",
+		"completionsQuotaExceededContext": "",
+		"walkthroughCommand": "",
+		"completionsMenuCommand": "",
+		"chatRefreshTokenCommand": "",
+		"generateCommitMessageCommand": "void.generateCommitMessageAction",
+		"resolveMergeConflictsCommand": "",
+		"completionsAdvancedSetting": "",
+		"completionsEnablementSetting": "",
+		"nextEditSuggestionsSetting": "",
+		"optimizeUsageDocumentationUrl": "https://aka.ms/token-usage-tips",
+		"mcpConnectorsUrl": "https://api.github.com/copilot-connectors/api/v1",
+		"managedSettingsUrl": "https://api.github.com/copilot_internal/managed_settings"
+	},
+	"quality": "stable",
+	"builtInExtensionsEnabledWithAutoUpdates": [],
+	"linuxDesktopName": "com.visualstudio.CodeOSS",
+	"nodejsArtifactFeed": "",
+	"electronArtifactFeed": "",
+	"voiceWsUrl": "wss://falcon-caas.mai.microsoft.com/voice-code/api/v1/realtime/voice"
+}
