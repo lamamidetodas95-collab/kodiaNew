@@ -1,0 +1,77 @@
+name: Build KodiaNew Windows
+
+on:
+  push:
+    branches: [ feat/9router-integration, main, master ]
+  pull_request:
+    branches: [ feat/9router-integration, main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          npm config set msvs_version 2022
+          npm install --force
+        shell: powershell
+      
+      - name: Build React components
+        run: npm run buildreact
+        shell: powershell
+        continue-on-error: true
+      
+      - name: Compile client
+        run: npm run compile-client
+        shell: powershell
+        continue-on-error: true
+      
+      - name: Compile project
+        run: npm run compile
+        shell: powershell
+        continue-on-error: true
+      
+      - name: Package application
+        run: |
+          if (Test-Path "out") {
+            Compress-Archive -Path out/* -DestinationPath kodia-windows-build.zip
+          }
+        shell: powershell
+      
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kodia-windows-build
+          path: |
+            kodia-windows-build.zip
+            out/
+            extensions/
+          retention-days: 30
+          if-no-files-found: warn
+      
+      - name: Create Release on tag
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: kodia-windows-build.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

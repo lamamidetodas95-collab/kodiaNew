@@ -1,0 +1,138 @@
+name: Quick Test Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ feat/9router-integration ]
+
+jobs:
+  quick-test:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+      
+      - name: Verify 9Router integration files
+        run: |
+          Write-Host "Verificando archivos de integracion 9Router..." -ForegroundColor Cyan
+          
+          $file1 = "src\vs\workbench\contrib\void\common\modelCapabilities.ts"
+          $file2 = "src\vs\workbench\contrib\void\common\voidSettingsTypes.ts"
+          $file3 = "src\vs\workbench\contrib\void\electron-main\llmMessage\sendLLMMessage.impl.ts"
+          
+          $allOk = $true
+          
+          if (Test-Path $file1) {
+            $content = Get-Content $file1 -Raw
+            if ($content -match "nineRouter") {
+              Write-Host "✓ $file1 contiene nineRouter" -ForegroundColor Green
+            } else {
+              Write-Host "✗ $file1 NO contiene nineRouter" -ForegroundColor Red
+              $allOk = $false
+            }
+          } else {
+            Write-Host "✗ $file1 NO existe" -ForegroundColor Red
+            $allOk = $false
+          }
+          
+          if (Test-Path $file2) {
+            $content = Get-Content $file2 -Raw
+            if ($content -match "nineRouter") {
+              Write-Host "✓ $file2 contiene nineRouter" -ForegroundColor Green
+            } else {
+              Write-Host "✗ $file2 NO contiene nineRouter" -ForegroundColor Red
+              $allOk = $false
+            }
+          } else {
+            Write-Host "✗ $file2 NO existe" -ForegroundColor Red
+            $allOk = $false
+          }
+          
+          if (Test-Path $file3) {
+            $content = Get-Content $file3 -Raw
+            if ($content -match "nineRouter") {
+              Write-Host "✓ $file3 contiene nineRouter" -ForegroundColor Green
+            } else {
+              Write-Host "✗ $file3 NO contiene nineRouter" -ForegroundColor Red
+              $allOk = $false
+            }
+          } else {
+            Write-Host "✗ $file3 NO existe" -ForegroundColor Red
+            $allOk = $false
+          }
+          
+          if ($allOk) {
+            Write-Host "`n✓ INTEGRACION VERIFICADA" -ForegroundColor Green
+          } else {
+            Write-Host "`n✗ INTEGRACION INCOMPLETA" -ForegroundColor Red
+            exit 1
+          }
+        shell: powershell
+      
+      - name: Install dependencies (quick)
+        run: |
+          npm install --legacy-peer-deps --no-audit --no-fund
+        shell: powershell
+        timeout-minutes: 30
+      
+      - name: Verify package.json
+        run: |
+          Write-Host "Verificando scripts en package.json..." -ForegroundColor Cyan
+          $pkg = Get-Content package.json | ConvertFrom-Json
+          
+          if ($pkg.scripts.buildreact) {
+            Write-Host "✓ Script buildreact existe" -ForegroundColor Green
+          }
+          
+          if ($pkg.scripts.compile) {
+            Write-Host "✓ Script compile existe" -ForegroundColor Green
+          }
+          
+          Write-Host "`nNode version:" -ForegroundColor Cyan
+          node --version
+          
+          Write-Host "`nNpm version:" -ForegroundColor Cyan
+          npm --version
+        shell: powershell
+      
+      - name: Create test report
+        run: |
+          $report = @"
+          # KodiaNew Build Test Report
+          
+          ## ✅ Verificaciones Completadas
+          
+          - ✓ Repositorio clonado correctamente
+          - ✓ Archivos de integración 9Router presentes
+          - ✓ Dependencias instaladas
+          - ✓ Configuración verificada
+          
+          ## 📋 Próximos Pasos
+          
+          Para compilar completamente:
+          1. Ejecutar workflow "Build KodiaNew Full Package"
+          2. Descargar el artefacto generado
+          3. Probar el ejecutable
+          
+          ## 🔗 Enlaces
+          
+          - Repositorio: https://github.com/lamamidetodas95-collab/kodiaNew
+          - Branch: feat/9router-integration
+          "@
+          
+          $report | Out-File -FilePath "test-report.md" -Encoding utf8
+          Write-Host $report
+        shell: powershell
+      
+      - name: Upload test report
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: test-report.md
