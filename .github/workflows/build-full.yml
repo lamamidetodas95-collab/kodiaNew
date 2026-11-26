@@ -10,26 +10,26 @@ jobs:
   build-windows-full:
     runs-on: windows-latest
     timeout-minutes: 180
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: '20.18.0'
-      
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
-      
+
       - name: Cache npm dependencies
         uses: actions/cache@v3
         with:
@@ -37,73 +37,77 @@ jobs:
           key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-node-
-      
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
       - name: Install dependencies
         run: |
-          npm config set msvs_version 2022
-          npm install --legacy-peer-deps
+          npm install --legacy-peer-deps --ignore-scripts
         shell: powershell
-      
+        env:
+          npm_config_msvs_version: 2022
+
       - name: Build React components
         run: npm run buildreact
         shell: powershell
-      
+
       - name: Compile TypeScript
         run: npm run compile
         shell: powershell
-      
+
       - name: Build CLI (Rust)
         run: |
           cd cli
           cargo build --release
         shell: powershell
         continue-on-error: true
-      
+
       - name: Create distribution package
         run: |
           $distFolder = "kodia-dist"
           New-Item -ItemType Directory -Force -Path $distFolder
-          
+
           # Copiar archivos compilados
           if (Test-Path "out") {
             Copy-Item -Path "out" -Destination "$distFolder\out" -Recurse -Force
           }
-          
+
           if (Test-Path "extensions") {
             Copy-Item -Path "extensions" -Destination "$distFolder\extensions" -Recurse -Force
           }
-          
+
           if (Test-Path "resources") {
             Copy-Item -Path "resources" -Destination "$distFolder\resources" -Recurse -Force
           }
-          
+
           # Copiar archivos necesarios
           Copy-Item -Path "package.json" -Destination "$distFolder\" -Force
           Copy-Item -Path "product.json" -Destination "$distFolder\" -Force
           Copy-Item -Path "LICENSE.txt" -Destination "$distFolder\" -Force
           Copy-Item -Path "README.md" -Destination "$distFolder\" -Force
-          
+
           # Copiar documentación de 9Router
           Copy-Item -Path "INTEGRATION_9ROUTER.md" -Destination "$distFolder\" -Force -ErrorAction SilentlyContinue
           Copy-Item -Path "README_9ROUTER_ES.md" -Destination "$distFolder\" -Force -ErrorAction SilentlyContinue
           Copy-Item -Path "QUICK_START.md" -Destination "$distFolder\" -Force -ErrorAction SilentlyContinue
-          
+
           # Copiar CLI si existe
           if (Test-Path "cli\target\release\code.exe") {
             Copy-Item -Path "cli\target\release\code.exe" -Destination "$distFolder\code.exe" -Force
           }
-          
+
           # Crear archivo ZIP
           Compress-Archive -Path "$distFolder\*" -DestinationPath "KodiaNew-Windows-x64.zip" -Force
         shell: powershell
-      
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: KodiaNew-Windows-x64
           path: KodiaNew-Windows-x64.zip
           retention-days: 90
-      
+
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
@@ -111,39 +115,39 @@ jobs:
           files: KodiaNew-Windows-x64.zip
           body: |
             # KodiaNew con 9Router Integrado
-            
+
             ## 🚀 Instalación
-            
+
             1. Descarga `KodiaNew-Windows-x64.zip`
             2. Extrae el contenido
             3. Ejecuta `code.exe` (o el ejecutable principal)
-            
+
             ## ⚙️ Configuración de 9Router
-            
+
             1. Ejecuta 9Router localmente:
                ```bash
                npm start
                # Corre en http://localhost:20128
                ```
-            
+
             2. En KodiaNew, el provider **9Router** ya está configurado:
                - Endpoint: `http://localhost:20128`
                - Modelos: `kr/claude-sonnet-4.5`, `kr/glm-5`, etc.
-            
+
             ## 📚 Documentación
-            
+
             - Ver `INTEGRATION_9ROUTER.md` para guía técnica
             - Ver `README_9ROUTER_ES.md` para documentación completa
             - Ver `QUICK_START.md` para inicio rápido
-            
+
             ## ✨ Modelos Disponibles
-            
+
             - `kr/claude-sonnet-4.5` - Claude Sonnet 4.5 (Kiro AI) ⭐
             - `kr/glm-5` - GLM-5 (Kiro AI)
             - `opencode/claude-sonnet-4.5` - Claude Sonnet 4.5 (OpenCode)
             - `deepseek-chat` - DeepSeek Chat
             - `deepseek-reasoner` - DeepSeek Reasoner
-            
+
             ¡Disfruta de IA gratis para codear! 🎉
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
