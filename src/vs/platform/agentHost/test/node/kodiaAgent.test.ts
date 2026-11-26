@@ -1,0 +1,1747 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright 2025 Glass Devtools, Inc. All rights reserved.
+ *  Licensed under the Apache License, Version 2.0. See LICENSE.txt for more information.
+ *--------------------------------------------------------------------------------------------*/
+
+import assert from 'assert';
+import * as fs from 'fs';
+import * as os from 'os';
+import { CancellationToken } from '../../../../base/common/cancellation.js';
+import { CancellationError } from '../../../../base/common/errors.js';
+import { Event } from '../../../../base/common/event.js';
+import { isWindows } from '../../../../base/common/platform.js';
+import { join } from '../../../../base/common/path.js';
+import { IDisposable, toDisposable } from '../../../../base/common/lifecycle.js';
+import { URI } from '../../../../base/common/uri.js';
+import { encodeBase64, VSBuffer } from '../../../../base/common/buffer.js';
+import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../base/test/common/utils.js';
+import type { INativeEnvironmentService } from '../../../environment/common/environment.js';
+import { FileService } from '../../../files/common/fileService.js';
+import { InMemoryFileSystemProvider } from '../../../files/common/inMemoryFilesystemProvider.js';
+import { NullLogService } from '../../../log/common/log.js';
+import { AgentSession, type AgentSignal, type IAgentActionSignal, type IAgentChatDataChange, type IAgentToolPendingConfirmationSignal } from '../../common/agent.js';
+import type { IByokLmBridgeConnection, IByokLmChatDelta, IByokLmChatRequest, IByokLmChatResult, IByokLmContentPart, IByokLmFunctionTool, IByokLmMessageItem, IByokLmModelInfo, IKodiaAutoApprove, IKodiaMcpTool, IKodiaMcpToolResult } from '../../common/agentHostByokLm.js';
+import { toHostSnapshotAttachmentMeta } from '../../common/meta/agentSnapshotAttachmentMeta.js';
+import { BackgroundWorkKind, TerminalClaimKind } from '../../common/state/protocol/state.js';
+import { ActionType, type ChatAction } from '../../common/state/sessionActions.js';
+import { buildDefaultChatUri, ChatInputAnswerState, ChatInputAnswerValueKind, ChatInputQuestionKind, ChatInputResponseKind, MessageAttachmentKind, parseRequiredSessionUriFromChatUri, ResponsePartKind, ToolCallConfirmationReason, ToolResultContentType, type ChatInputAnswer, type ChatInputRequest, type MessageAttachment } from '../../common/state/sessionState.js';
+import type { IByokLmBridgeRegistry } from '../../node/byokLmBridgeRegistry.js';
+import { KodiaAgent, SMALL_CONTEXT_WINDOW_TOKENS } from '../../node/kodia/kodiaAgent.js';
+import { describeKodiaToolCall } from '../../node/kodia/kodiaTools.js';
+import { FakeTerminalManager } from './kodiaFakeTerminalManager.js';
+import { editorToolNames, persistentTerminalToolNames } from '../../../kodia/common/toolCatalog.js';
+import { CLEARED_TOOL_RESULT, summarizedThreadMessage, summarizeThread_systemMessage } from '../../../kodia/common/threadSummary.js';
+import { IMAGE_NOT_SEEN_NOTE } from '../../node/kodia/kodiaContext.js';
+
+/** A Kodia window: replays scripted results and records each request and its token. */
+class FakeKodiaWindow implements IByokLmBridgeConnection {
+	readonly onDidChangeModels: Event<IByokLmModelInfo[]> = Event.None;
+	readonly requests: IByokLmChatRequest[] = [];
+	readonly tokens: CancellationToken[] = [];
+	results: IByokLmChatResult[] = [];
+	/** When set, the next request waits for it instead of answering. */
+	pending: Promise<IByokLmChatResult> | undefined;
+	/** The window's MCP servers; undefined for a window that doesn't offer MCP tools. */
+	mcp: { tools: IKodiaMcpTool[]; result: IKodiaMcpToolResult; calls: { name: string; argsJson: string }[]; listError?: Error } | undefined;
+
+	/** What Kodia's settings let run without asking; undefined for a window that doesn't say, an error for one that can't. */
+	autoApprove: IKodiaAutoApprove | Error | undefined;
+
+	get getAutoApprove() {
+		const setting = this.autoApprove;
+		return setting && (async () => { if (setting instanceof Error) { throw setting; } return setting; });
+	}
+
+	/** The editor tools this window runs: an editor window offers them, the Agents Window an empty list; undefined for an older window. */
+	editor: { names: string[]; result: IKodiaMcpToolResult; calls: { name: string; argsJson: string }[]; listError?: Error } | undefined;
+
+	get listEditorTools() {
+		const editor = this.editor;
+		return editor && (async () => { if (editor.listError) { throw editor.listError; } return editor.names; });
+	}
+
+	get callEditorTool() {
+		const editor = this.editor;
+		return editor && (async (name: string, argsJson: string) => { editor.calls.push({ name, argsJson }); return editor.result; });
+	}
+
+	/**
+	 * A window that streams: it reports the deltas of each reply, one list per request, as the model writes them, then
+	 * answers with the next result, once `gate` is open. A cancelled request rejects, as the connection does. Undefined
+	 * for a window that doesn't stream (an older one), which answers at the end.
+	 */
+	stream: { replies: IByokLmChatDelta[][]; gate?: Promise<void> } | undefined;
+	/** The delta callback of the latest streamed request, which a window may call late. */
+	latestOnDelta: ((delta: IByokLmChatDelta) => void) | undefined;
+
+	get chatStream() {
+		const stream = this.stream;
+		return stream && (async (request: IByokLmChatRequest, onDelta: (delta: IByokLmChatDelta) => void, token?: CancellationToken): Promise<IByokLmChatResult> => {
+			this.requests.push(JSON.parse(JSON.stringify(request)));
+			this.tokens.push(token ?? CancellationToken.None);
+			this.latestOnDelta = onDelta;
+			for (const delta of stream.replies.shift() ?? []) {
+				onDelta(delta);
+			}
+			let cancelled!: (error: Error) => void;
+			const listener = token?.onCancellationRequested(() => cancelled(new CancellationError()));
+			try {
+				await Promise.race([stream.gate, new Promise<never>((_, reject) => cancelled = reject)]);
+			} finally {
+				listener?.dispose();
+			}
+			return this.results.shift() ?? { output: [] };
+		});
+	}
+
+	get listMcpTools() {
+		const mcp = this.mcp;
+		return mcp && (async () => { if (mcp.listError) { throw mcp.listError; } return mcp.tools; });
+	}
+
+	get callMcpTool() {
+		const mcp = this.mcp;
+		return mcp && (async (name: string, argsJson: string) => { mcp.calls.push({ name, argsJson }); return mcp.result; });
+	}
+
+	async chat(request: IByokLmChatRequest, token?: CancellationToken): Promise<IByokLmChatResult> {
+		// Snapshot: the agent keeps appending to the history it sent.
+		this.requests.push(JSON.parse(JSON.stringify(request)));
+		this.tokens.push(token ?? CancellationToken.None);
+		if (this.pending) {
+			return this.pending;
+		}
+		return this.results.shift() ?? { output: [] };
+	}
+}
+
+class FakeBridgeRegistry implements IByokLmBridgeRegistry {
+	declare readonly _serviceBrand: undefined;
+	private readonly _listeners = new Set<() => void>();
+	models: IByokLmModelInfo[] = [];
+	window: FakeKodiaWindow | undefined = new FakeKodiaWindow();
+	/** The other windows that serve the models: the one serving the turn is `window`. */
+	others: FakeKodiaWindow[] = [];
+
+	register(): IDisposable { return toDisposable(() => { }); }
+	getModels(): readonly IByokLmModelInfo[] { return this.window ? this.models : []; }
+	getServingConnection(): IByokLmBridgeConnection | undefined { return this.window; }
+	getServingConnections(): readonly IByokLmBridgeConnection[] { return this.window ? [this.window, ...this.others] : []; }
+	onDidChangeModels(listener: () => void): IDisposable {
+		this._listeners.add(listener);
+		return toDisposable(() => this._listeners.delete(listener));
+	}
+	setModels(models: IByokLmModelInfo[]): void {
+		this.models = models;
+		for (const listener of this._listeners) {
+			listener();
+		}
+	}
+}
+
+function actionTypes(signals: readonly AgentSignal[]): string[] {
+	return signals.filter((s): s is IAgentActionSignal => s.kind === 'action').map(s => s.action.type);
+}
+
+function text(value: string): IByokLmChatResult {
+	return { output: [{ type: 'message', content: [{ type: 'text', text: value }] }], usage: { inputTokens: 10, outputTokens: 5 } };
+}
+
+suite('KodiaAgent', () => {
+	const store = ensureNoDisposablesAreLeakedInTestSuite();
+
+	const gemini: IByokLmModelInfo = { vendor: 'gemini', id: 'gemini-3-pro', name: 'gemini-3-pro', maxContextWindowTokens: 1_000_000, supportsVision: true };
+	const openRouter: IByokLmModelInfo = { vendor: 'openRouter', id: 'qwen/qwen3-coder', name: 'qwen/qwen3-coder' };
+
+	const userHome = URI.file('/home/me');
+
+	function createAgent(registry = new FakeBridgeRegistry()): { agent: KodiaAgent; registry: FakeBridgeRegistry; terminals: FakeTerminalManager; write: (path: string, content: string) => Promise<void> } {
+		registry.models = [gemini, openRouter];
+		// the agent reads the project's rules and skills through the file service, here an in-memory disk
+		const fileService = store.add(new FileService(new NullLogService()));
+		store.add(fileService.registerProvider('file', store.add(new InMemoryFileSystemProvider())));
+		const environmentService = { userHome } as INativeEnvironmentService;
+		const write = async (path: string, content: string) => { await fileService.writeFile(URI.file(path), VSBuffer.fromString(content)); };
+		// the persistent terminals of the agent are those of the agent host, here a fake
+		const terminals = store.add(new FakeTerminalManager());
+		return { agent: store.add(new KodiaAgent(new NullLogService(), registry, fileService, environmentService, terminals)), registry, terminals, write };
+	}
+
+	let sessionCounter = 0;
+	function newChat(): { session: URI; chat: URI } {
+		const session = AgentSession.uri('kodia', `session-${++sessionCounter}`);
+		return { session, chat: URI.parse(buildDefaultChatUri(session)) };
+	}
+
+	function watch(agent: KodiaAgent) {
+		const signals: AgentSignal[] = [];
+		const data: IAgentChatDataChange[] = [];
+		store.add(agent.onDidChatProgress(s => signals.push(s)));
+		store.add(agent.onDidChangeChatData(e => data.push(e)));
+		return { signals, data };
+	}
+
+	const cwd = URI.file(os.tmpdir());
+
+	test('offers the models of the Kodia window as <provider>/<model>, and follows them', () => {
+		const { agent, registry } = createAgent();
+		assert.deepStrictEqual(agent.models.get().map(m => m.id), ['gemini/gemini-3-pro', 'openRouter/qwen/qwen3-coder']);
+		assert.strictEqual(agent.models.get()[0].maxContextWindow, 1_000_000);
+		assert.strictEqual(agent.models.get()[0].supportsVision, true);
+
+		registry.setModels([openRouter]);
+		assert.deepStrictEqual(agent.models.get().map(m => m.id), ['openRouter/qwen/qwen3-coder']);
+
+		registry.window = undefined;
+		registry.setModels([openRouter]);
+		assert.deepStrictEqual(agent.models.get(), [], 'no model without a Kodia window to run it');
+	});
+
+	test('does not ask for GitHub', () => {
+		const { agent } = createAgent();
+		assert.deepStrictEqual(agent.getProtectedResources().map(r => r.required), [false]);
+	});
+
+	test('a turn runs the chat\'s model in the Kodia window and persists the history', async () => {
+		const { agent, registry } = createAgent();
+		registry.window!.results = [text('Hello!')];
+		const { session, chat } = newChat();
+		const { signals, data } = watch(agent);
+		await agent.chats.createChat(chat, session, { workingDirectories: [cwd], model: { id: 'openRouter/qwen/qwen3-coder' } });
+
+		await agent.chats.sendMessage(chat, 'Hi', [cwd], undefined, 'turn-1');
+
+		const request = registry.window!.requests[0];
+		assert.strictEqual(request.vendor, 'openRouter');
+		assert.strictEqual(request.modelId, 'qwen/qwen3-coder');
+		assert.deepStrictEqual(request.tools?.map(t => t.name), ['read_file', 'ls_dir', 'get_dir_tree', 'search_pathnames_only', 'search_for_files', 'search_codebase', 'search_in_file', 'create_file_or_folder', 'delete_file_or_folder', 'edit_file', 'rewrite_file', 'run_command', 'fetch_url', 'write_project_memory', 'git_status', 'git_diff', 'git_log', 'git_show', 'todo_write', 'run_subagent', ...persistentTerminalToolNames]);
+		assert.deepStrictEqual(request.input, [{ type: 'message', role: 'user', content: [{ type: 'text', text: 'Hi' }] }]);
+		assert.deepStrictEqual(actionTypes(signals), [ActionType.ChatUsage, ActionType.ChatResponsePart, ActionType.ChatTurnComplete]);
+
+		// The history is in the backing, so a restored chat shows the turn.
+		const restored = createAgent().agent;
+		await restored.materializeChat(chat, session, data[data.length - 1].providerData);
+		const turns = await restored.chats.getMessages(chat, session);
+		assert.strictEqual(turns.length, 1);
+		assert.strictEqual(turns[0].id, 'turn-1');
+		assert.strictEqual(turns[0].message.text, 'Hi');
+		assert.deepStrictEqual(turns[0].responseParts.map(p => p.kind === ResponsePartKind.Markdown ? p.content : p.kind), ['Hello!']);
+	});
+
+	test('tells the model the project\'s rules and skills, as Kodia\'s chat does', async () => {
+		const { agent, registry, write } = createAgent();
+		registry.window!.results = [text('Done.')];
+		const project = URI.file('/project');
+		await write('/project/AGENTS.md', 'Answer in French.');
+		await write('/project/CLAUDE.md', 'Answer in French.');
+		await write('/project/.cursorrules', 'Use tabs.');
+		await write('/project/.agents/skills/tdd/SKILL.md', '---\nname: tdd\ndescription: Use when writing tests first.\n---\nRed, green, refactor.');
+		await write('/project/.claude/skills/tdd/SKILL.md', '---\nname: tdd\ndescription: A copy of the same skill.\n---\n');
+		await write('/project/.claude/skills/release/SKILL.md', '---\nname: release\ndescription: Only for the user to run.\ndisable-model-invocation: true\n---\n');
+		await write('/home/me/.claude/skills/review/SKILL.md', '---\nname: review\ndescription: Use when reviewing a diff.\n---\n');
+		await write('/project/.kodia/memory.md', '<!-- notes -->\n\n## Commands\nnpm run test-void');
+		const { chat, session } = newChat();
+		await agent.chats.createChat(chat, session, { workingDirectories: [project] });
+
+		await agent.chats.sendMessage(chat, 'Hi', [project], undefined, 'turn-1');
+
+		const instructions = registry.window!.requests[0].instructions ?? '';
+		assert.ok(instructions.startsWith('You are a coding agent.'), 'the agent\'s own instructions come first');
+		assert.ok(instructions.includes('PROJECT RULES (from the project\'s rules files):\nFrom AGENTS.md:\nAnswer in French.\n\nFrom .cursorrules:\nUse tabs.'), instructions);
+		assert.ok(!instructions.includes('From CLAUDE.md'), 'a copy of an earlier rules file is left out');
+		assert.ok(instructions.indexOf('PROJECT RULES') < instructions.indexOf('SKILLS ('), 'the rules come before the skills');
+		const skillNames = [...instructions.matchAll(/<name>(.*)<\/name>/g)].map(m => m[1]);
+		assert.deepStrictEqual(skillNames, ['tdd', 'review'], 'the project\'s skills, then the user\'s, each once, without the one only the user may run');
+		assert.ok(instructions.includes('<description>Use when writing tests first.</description>'), 'the first folder\'s copy is the one listed');
+		assert.ok(instructions.includes('<file>/project/.agents/skills/tdd/SKILL.md</file>'), instructions);
+		// the project's memory comes last, as in the chat, and the model isn't told to read it with a tool
+		assert.ok(instructions.includes('PROJECT MEMORY (.kodia/memory.md: notes kept across sessions; rewrite a section with write_project_memory when something here is outdated or worth adding):\n<!-- notes -->\n\n## Commands\nnpm run test-void'), instructions);
+		assert.ok(instructions.indexOf('SKILLS (') < instructions.indexOf('PROJECT MEMORY'), 'the skills come before the memory');
+		assert.ok(!instructions.includes('read_project_memory'));
+	});
+
+	test('a project without rules or skills adds nothing to the agent\'s instructions', async () => {
+		const { agent, registry } = createAgent();
+		registry.window!.results = [text('Done.')];
+		const project = URI.file('/empty');
+		const { chat, session } = newChat();
+		await agent.chats.createChat(chat, session, { workingDirectories: [project] });
+
+		await agent.chats.sendMessage(chat, 'Hi', [project], undefined, 'turn-1');
+
+		const instructions = registry.window!.requests[0].instructions ?? '';
+		assert.ok(!instructions.includes('PROJECT RULES') && !instructions.includes('SKILLS (') && !instructions.includes('PROJECT MEMORY'), instructions);
+	});
+
+	test('reads the rules and skills once a turn, not at each round of tool calls', async () => {
+		const { agent, registry, write } = createAgent();
+		registry.window!.results = [
+			{ output: [{ type: 'function_call', callId: 'call-1', name: 'ls_dir', argumentsJson: '{}' }] },
+			text('Done.'),
+		];
+		const project = URI.file('/project');
+		await write('/project/AGENTS.md', 'Be brief.');
+		const { chat, session } = newChat();
+		await agent.chats.createChat(chat, session, { workingDirectories: [project] });
+
+		await agent.chats.sendMessage(chat, 'What is here?', [project], undefined, 'turn-1');
+
+		const [first, second] = registry.window!.requests.map(r => r.instructions ?? '');
+		assert.ok(first.includes('From AGENTS.md:\nBe brief.'));
+		assert.strictEqual(second, first);
+	});
+
+	test('a model with a small context window gets a lighter prompt: one line a skill, no tool another one stands in for', async () => {
+		const { agent, registry, write } = createAgent();
+		const local: IByokLmModelInfo = { vendor: 'local', id: 'small-1', name: 'small-1', maxContextWindowTokens: SMALL_CONTEXT_WINDOW_TOKENS };
+		registry.setModels([gemini, local]);
+		registry.window!.editor = { names: [...editorToolNames], result: { isError: false, output: '' }, calls: [] };
+		registry.window!.results = [text('Done.'), text('Done.')];
+		const project = URI.file('/project');
+		await write('/project/.agents/skills/tdd/SKILL.md', `---\nname: tdd\ndescription: Use when writing tests first. ${'More about it. '.repeat(20)}\n---\n`);
+		const small = newChat();
+		await agent.chats.createChat(small.chat, small.session, { workingDirectories: [project], model: { id: 'local/small-1' } });
+		const large = newChat();
+		await agent.chats.createChat(large.chat, large.session, { workingDirectories: [project], model: { id: 'gemini/gemini-3-pro' } });
+
+		await agent.chats.sendMessage(small.chat, 'Hi', [project], undefined, 'turn-1');
+		await agent.chats.sendMessage(large.chat, 'Hi', [project], undefined, 'turn-1');
+
+		const [toSmall, toLarge] = registry.window!.requests;
+		const skillLine = toSmall.instructions!.split('\n').find(line => line.startsWith('- tdd: '))!;
+		assert.ok(skillLine.startsWith('- tdd: Use when writing tests first. More about it.') && skillLine.endsWith('... (/project/.agents/skills/tdd/SKILL.md)'), skillLine);
+		assert.ok(skillLine.length < 160 && !toSmall.instructions!.includes('<skill>'));
+		assert.ok(toLarge.instructions!.includes('<skill>\n<name>tdd</name>'));
+
+		const namesOf = (request: IByokLmChatRequest) => request.tools!.map(tool => tool.name);
+		const leftOut = namesOf(toLarge).filter(name => !namesOf(toSmall).includes(name));
+		assert.deepStrictEqual(leftOut, [...persistentTerminalToolNames, ...editorToolNames.filter(name => name !== 'read_lint_errors')]);
+		assert.ok(namesOf(toSmall).includes('run_command') && namesOf(toSmall).includes('run_subagent') && namesOf(toSmall).includes('read_lint_errors'));
+	});
+
+	const issueSearch: IKodiaMcpTool = { name: 'a1b2_search', displayName: 'search', serverName: 'github', description: 'Search issues.', inputSchema: { type: 'object', properties: { query: { type: 'string' } } } };
+
+	/** Waits for the agent to ask for the approval of a tool call. */
+	async function nextApproval(signals: AgentSignal[]): Promise<IAgentToolPendingConfirmationSignal> {
+		for (let i = 0; i < 200 && !signals.some(s => s.kind === 'pending_confirmation'); i++) {
+			await new Promise(resolve => setTimeout(resolve, 1));
+		}
+		const request = signals.find((s): s is IAgentToolPendingConfirmationSignal => s.kind === 'pending_confirmation');
+		assert.ok(request, 'the agent asks for approval');
+		return request;
+	}
+
+	/** Waits for the agent to ask for the approval of a tool call, and answers it. */
+	async function answerApproval(agent: KodiaAgent, signals: AgentSignal[], approved: boolean): Promise<IAgentToolPendingConfirmationSignal> {
+		const request = await nextApproval(signals);
+		agent.respondToPermissionRequest(request.state.toolCallId, approved);
+		return request;
+	}
+
+	test('offers the Kodia window\'s MCP tools after its own, and runs one the user allows', async () => {
+		const { agent, registry } = createAgent();
+		const window = registry.window!;
+		window.mcp = { tools: [issueSearch], result: { isError: false, output: '3 issues' }, calls: [] };
+		window.results = [
+			{ output: [{ type: 'function_call', callId: 'call-1', name: 'a1b2_search', argumentsJson: '{"query":"bug"}' }] },
+			text('Found them.'),
+		];
+		const { session, chat } = newChat();
+		const { signals } = watch(agent);
+		await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+		const turn = agent.chats.sendMessage(chat, 'Look for bugs', [cwd], undefined, 'turn-1');
+		const request = await answerApproval(agent, signals, true);
+		await turn;
+
+		const tools = window.requests[0].tools!;
+		assert.strictEqual(tools[0].name, 'read_file', 'the agent\'s own tools come first');
+		assert.deepStrictEqual(tools[tools.length - 1], { type: 'function', name: 'a1b2_search', description: 'Search issues. (MCP server: github)', parametersSchema: issueSearch.inputSchema });
+		assert.strictEqual(request.permissionKind, 'mcp');
+		assert.strictEqual(request.state.displayName, 'search (github)');
+		assert.strictEqual(request.state.toolInput, '{"query":"bug"}');
+		assert.deepStrictEqual(window.mcp.calls, [{ name: 'a1b2_search', argsJson: '{"query":"bug"}' }]);
+		const output = window.requests[1].input.at(-1);
+		assert.deepStrictEqual(output, { type: 'function_call_output', callId: 'call-1', output: '3 issues' });
+	});
+
+	test('does not run an MCP tool the user denies, and tells the model', async () => {
+		const { agent, registry } = createAgent();
+		const window = registry.window!;
+		window.mcp = { tools: [issueSearch], result: { isError: false, output: 'should not run' }, calls: [] };
+		window.results = [
+			{ output: [{ type: 'function_call', callId: 'call-1', name: 'a1b2_search', argumentsJson: '{}' }] },
+			text('Understood.'),
+		];
+		const { session, chat } = newChat();
+		const { signals } = watch(agent);
+		await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+		const turn = agent.chats.sendMessage(chat, 'Look for bugs', [cwd], undefined, 'turn-1');
+		await answerApproval(agent, signals, false);
+		await turn;
+
+		assert.deepStrictEqual(window.mcp.calls, []);
+		assert.deepStrictEqual(window.requests[1].input.at(-1), { type: 'function_call_output', callId: 'call-1', output: 'The user denied this tool call.' });
+	});
+
+	test('an MCP tool that fails tells the model why, and a long result is cut', async () => {
+		const { agent, registry } = createAgent();
+		const window = registry.window!;
+		window.mcp = { tools: [issueSearch], result: { isError: true, output: 'Rate limited.' }, calls: [] };
+		window.results = [
+			{ output: [{ type: 'function_call', callId: 'call-1', name: 'a1b2_search', argumentsJson: '{}' }] },
+			{ output: [{ type: 'function_call', callId: 'call-2', name: 'a1b2_search', argumentsJson: '{}' }] },
+			text('Done.'),
+		];
+		const { session, chat } = newChat();
+		const { signals } = watch(agent);
+		await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+		const turn = agent.chats.sendMessage(chat, 'Look for bugs', [cwd], undefined, 'turn-1');
+		await answerApproval(agent, signals, true);
+		// the second call is asked for once the first one's failure went back to the model
+		signals.length = 0;
+		const second = await nextApproval(signals);
+		window.mcp.result = { isError: false, output: 'x'.repeat(150_000) };
+		agent.respondToPermissionRequest(second.state.toolCallId, true);
+		await turn;
+
+		assert.deepStrictEqual(window.requests[1].input.at(-1), { type: 'function_call_output', callId: 'call-1', output: 'Rate limited.' });
+		const long = window.requests[2].input.at(-1) as { output: string };
+		assert.ok(long.output.startsWith('x'.repeat(100_000) + '\n(The output is cut here.)'), long.output.slice(99_990, 100_040));
+		assert.ok(long.output.length < 100_100);
+		assert.ok(actionTypes(signals).includes(ActionType.ChatToolCallComplete), 'the second call completes');
+	});
+
+	test('has only its own tools when the window offers no MCP tools, or can\'t list them', async () => {
+		const ownTools = ['read_file', 'ls_dir', 'get_dir_tree', 'search_pathnames_only', 'search_for_files', 'search_codebase', 'search_in_file', 'create_file_or_folder', 'delete_file_or_folder', 'edit_file', 'rewrite_file', 'run_command', 'fetch_url', 'write_project_memory', 'git_status', 'git_diff', 'git_log', 'git_show', 'todo_write', 'run_subagent', ...persistentTerminalToolNames];
+		for (const mcp of [undefined, { tools: [issueSearch], result: { isError: false, output: '' }, calls: [], listError: new Error('MCP is not ready.') }]) {
+			const { agent, registry } = createAgent();
+			registry.window!.mcp = mcp;
+			registry.window!.results = [text('Done.')];
+			const { session, chat } = newChat();
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			await agent.chats.sendMessage(chat, 'Hi', [cwd], undefined, 'turn-1');
+
+			assert.deepStrictEqual(registry.window!.requests[0].tools?.map(t => t.name), ownTools);
+		}
+	});
+
+	test('an MCP tool never takes the name of one of the agent\'s own', async () => {
+		const { agent, registry } = createAgent();
+		registry.window!.mcp = { tools: [{ ...issueSearch, name: 'read_file' }, issueSearch], result: { isError: false, output: '' }, calls: [] };
+		registry.window!.results = [text('Done.')];
+		const { session, chat } = newChat();
+		await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+		await agent.chats.sendMessage(chat, 'Hi', [cwd], undefined, 'turn-1');
+
+		const names = registry.window!.requests[0].tools!.map(t => t.name);
+		assert.strictEqual(names.filter(n => n === 'read_file').length, 1);
+		assert.strictEqual(names.at(-1), 'a1b2_search');
+	});
+
+	test('runs a read-only tool the model calls and sends its result back', async () => {
+		const { agent, registry } = createAgent();
+		registry.window!.results = [
+			{ output: [{ type: 'function_call', callId: 'call-1', name: 'ls_dir', argumentsJson: '{}' }] },
+			text('Done.'),
+		];
+		const { session, chat } = newChat();
+		const { signals } = watch(agent);
+		await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+		await agent.chats.sendMessage(chat, 'What is here?', [cwd], undefined, 'turn-1');
+
+		assert.strictEqual(registry.window!.requests[0].vendor, 'gemini', 'without a chosen model, the first one runs');
+		const second = registry.window!.requests[1].input;
+		assert.deepStrictEqual(second.map(item => item.type), ['message', 'function_call', 'function_call_output']);
+		assert.deepStrictEqual(actionTypes(signals), [
+			ActionType.ChatToolCallStart, ActionType.ChatToolCallReady, ActionType.ChatToolCallComplete,
+			ActionType.ChatUsage, ActionType.ChatResponsePart, ActionType.ChatTurnComplete,
+		]);
+	});
+
+	test('a model error fails the turn and keeps the history consistent', async () => {
+		const { agent, registry } = createAgent();
+		registry.window!.results = [{ output: [], error: 'Invalid API key' }, text('Back.')];
+		const { session, chat } = newChat();
+		const { signals } = watch(agent);
+		await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+		await agent.chats.sendMessage(chat, 'Hi', [cwd], undefined, 'turn-1');
+		assert.deepStrictEqual(actionTypes(signals), [ActionType.ChatError]);
+
+		await agent.chats.sendMessage(chat, 'Again', [cwd], undefined, 'turn-2');
+		assert.deepStrictEqual(registry.window!.requests[1].input.map(item => item.type === 'message' ? item.role : item.type), ['user', 'user']);
+	});
+
+	suite('a model request that fails', () => {
+		const failed: IByokLmChatResult = { output: [], error: 'fetch failed: ECONNREFUSED' };
+
+		test('is sent again, and the turn goes on from the reply', async () => {
+			const { agent, registry } = createAgent();
+			agent.retryDelayMs = 0;
+			registry.window!.results = [failed, failed, text('Here.')];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			await agent.chats.sendMessage(chat, 'Hi', [cwd], undefined, 'turn-1');
+
+			assert.strictEqual(registry.window!.requests.length, 3);
+			assert.deepStrictEqual(registry.window!.requests[2].input, registry.window!.requests[0].input, 'the same conversation is sent again');
+			assert.ok(!actionTypes(signals).includes(ActionType.ChatError));
+			assert.strictEqual(actionTypes(signals).at(-1), ActionType.ChatTurnComplete);
+		});
+
+		test('fails the turn after three requests', async () => {
+			const { agent, registry } = createAgent();
+			agent.retryDelayMs = 0;
+			registry.window!.results = [failed, failed, failed, text('Too late.')];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			await agent.chats.sendMessage(chat, 'Hi', [cwd], undefined, 'turn-1');
+
+			assert.strictEqual(registry.window!.requests.length, 3);
+			assert.deepStrictEqual(actionTypes(signals), [ActionType.ChatError]);
+		});
+
+		test('is not sent again when the provider refuses the key', async () => {
+			const { agent, registry } = createAgent();
+			agent.retryDelayMs = 0;
+			registry.window!.results = [{ output: [], error: '401 Incorrect API key provided' }, text('Never asked.')];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			await agent.chats.sendMessage(chat, 'Hi', [cwd], undefined, 'turn-1');
+
+			assert.strictEqual(registry.window!.requests.length, 1);
+			assert.deepStrictEqual(actionTypes(signals), [ActionType.ChatError]);
+		});
+
+		test('is not sent again once part of the reply is on screen: it would be written twice', async () => {
+			const { agent, registry } = createAgent();
+			agent.retryDelayMs = 0;
+			registry.window!.stream = { replies: [[{ text: 'The first ha' }]] };
+			registry.window!.results = [failed, text('Never asked.')];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			await agent.chats.sendMessage(chat, 'Hi', [cwd], undefined, 'turn-1');
+
+			assert.strictEqual(registry.window!.requests.length, 1);
+			assert.strictEqual(actionTypes(signals).at(-1), ActionType.ChatError);
+		});
+
+		test('stopping the turn while it waits to send again ends it at once', async () => {
+			const { agent, registry } = createAgent();
+			agent.retryDelayMs = 60_000;
+			registry.window!.results = [failed, text('Never asked.')];
+			const { session, chat } = newChat();
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			const turn = agent.chats.sendMessage(chat, 'Hi', [cwd], undefined, 'turn-1');
+			await new Promise(resolve => setTimeout(resolve, 0));
+			await agent.chats.abort(chat, session);
+			await turn;
+
+			assert.strictEqual(registry.window!.requests.length, 1);
+		});
+	});
+
+	suite('a sub-agent, which researches in a conversation of its own', () => {
+		const call = (name: string, args: object, callId: string): IByokLmChatResult => ({ output: [{ type: 'function_call' as const, callId, name, argumentsJson: JSON.stringify(args) }] });
+		const outputs = (request: IByokLmChatRequest) => request.input.flatMap(item => item.type === 'function_call_output' ? [item.output] : []);
+
+		test('runs the task with the same model and read-only tools, and only its report comes back to the agent', async () => {
+			const { agent, registry } = createAgent();
+			registry.window!.results = [
+				call('run_subagent', { task: 'List the project folder and say what is in it.' }, 'main-1'),
+				call('ls_dir', { uri: '.' }, 'sub-1'),
+				text('The report: it has files.'),
+				text('Done.'),
+			];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd], model: { id: 'gemini/gemini-3-pro' } });
+
+			await agent.chats.sendMessage(chat, 'What is in the project?', [cwd], undefined, 'turn-1');
+
+			const [main, sub1, sub2, mainAgain] = registry.window!.requests;
+			assert.ok(main.tools?.some(tool => tool.name === 'run_subagent'));
+
+			// the sub-agent starts from the task alone, with its own instructions and the tools that only read
+			assert.strictEqual(sub1.modelId, 'gemini-3-pro');
+			assert.ok(sub1.instructions?.includes('research sub-agent'));
+			// the window leaves the user's frameworks out of the sub-agent's requests, not out of the agent's
+			assert.deepStrictEqual([main, sub1, sub2, mainAgain].map(request => request.withoutFrameworks === true), [false, true, true, false]);
+			assert.deepStrictEqual(sub1.input, [{ type: 'message', role: 'user', content: [{ type: 'text', text: 'List the project folder and say what is in it.' }] }]);
+			const subTools = sub1.tools!.map(tool => tool.name);
+			assert.deepStrictEqual(subTools, ['read_file', 'ls_dir', 'get_dir_tree', 'search_pathnames_only', 'search_for_files', 'search_codebase', 'search_in_file', 'git_status', 'git_diff', 'git_log', 'git_show']);
+
+			// it is sent the result of its own tool call
+			assert.strictEqual(outputs(sub2).length, 1);
+			assert.ok(outputs(sub2)[0].length > 0);
+
+			// the agent gets the report, and nothing of what the sub-agent read
+			assert.deepStrictEqual(outputs(mainAgain), ['The report: it has files.']);
+			assert.ok(!JSON.stringify(mainAgain.input).includes('sub-1'));
+			assert.strictEqual(actionTypes(signals).at(-1), ActionType.ChatTurnComplete);
+			assert.strictEqual(actionTypes(signals).filter(type => type === ActionType.ChatToolCallStart).length, 1, 'the window shows one tool call: the sub-agent');
+			// and, under it while it runs, what the sub-agent is doing
+			const steps = signals.flatMap(s => s.kind === 'action' && s.action.type === ActionType.ChatToolCallContentChanged ? [s.action] : []);
+			assert.strictEqual(steps.length, 1);
+			assert.strictEqual(steps[0].toolCallId, 'main-1');
+			const step = describeKodiaToolCall('ls_dir', '{"uri":"."}', cwd).invocationMessage;
+			assert.strictEqual(steps[0]._meta?.progressMessage, `Sub-agent: ${step}`);
+			assert.deepStrictEqual(steps[0].content, [{ type: ToolResultContentType.Text, text: step }]);
+		});
+
+		test('is told the project\'s rules, not its skills nor its memory', async () => {
+			const { agent, registry, write } = createAgent();
+			registry.window!.results = [
+				call('run_subagent', { task: 'Look.' }, 'main-1'),
+				text('The report.'),
+				text('Done.'),
+			];
+			const project = URI.file('/project');
+			await write('/project/AGENTS.md', 'Answer in French.');
+			await write('/project/.agents/skills/tdd/SKILL.md', '---\nname: tdd\ndescription: Use when writing tests first.\n---\n');
+			await write('/project/.kodia/memory.md', '## Commands\nnpm run test-void');
+			const { session, chat } = newChat();
+			await agent.chats.createChat(chat, session, { workingDirectories: [project] });
+
+			await agent.chats.sendMessage(chat, 'Hi', [project], undefined, 'turn-1');
+
+			const instructions = registry.window!.requests[1].instructions ?? '';
+			assert.ok(instructions.startsWith('You are a research sub-agent'), instructions);
+			assert.ok(instructions.endsWith('PROJECT RULES (from the project\'s rules files):\nFrom AGENTS.md:\nAnswer in French.'), instructions);
+			assert.ok(!instructions.includes('SKILLS (') && !instructions.includes('PROJECT MEMORY'), instructions);
+		});
+
+		test('cannot change the project: a tool that writes is refused, and the sub-agent is told', async () => {
+			const { agent, registry } = createAgent();
+			const target = join(os.tmpdir(), `kodia-subagent-${Date.now()}.txt`);
+			registry.window!.results = [
+				call('run_subagent', { task: 'Write a file.' }, 'main-1'),
+				call('create_file_or_folder', { uri: target }, 'sub-1'),
+				text('I could not write.'),
+				text('Done.'),
+			];
+			const { session, chat } = newChat();
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			await agent.chats.sendMessage(chat, 'Go', [cwd], undefined, 'turn-1');
+
+			assert.ok(outputs(registry.window!.requests[2])[0].includes('it only reads'));
+			assert.strictEqual(fs.existsSync(target), false);
+			assert.deepStrictEqual(outputs(registry.window!.requests[3]), ['I could not write.']);
+		});
+
+		test('a call without a task, and a sub-agent whose model fails, tell the agent why', async () => {
+			const { agent, registry } = createAgent();
+			agent.retryDelayMs = 0;
+			registry.window!.results = [
+				call('run_subagent', {}, 'main-1'),
+				call('run_subagent', { task: 'Look.' }, 'main-2'),
+				{ output: [], error: '401 Incorrect API key provided' },
+				text('Done.'),
+			];
+			const { session, chat } = newChat();
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			await agent.chats.sendMessage(chat, 'Go', [cwd], undefined, 'turn-1');
+
+			const last = outputs(registry.window!.requests.at(-1)!);
+			assert.ok(last[0].includes('Missing "task"'));
+			assert.ok(last[1].includes('model request failed') && last[1].includes('401'));
+		});
+
+		test('an MCP tool never takes the name of the sub-agent tool', async () => {
+			const { agent, registry } = createAgent();
+			registry.window!.mcp = { tools: [{ ...issueSearch, name: 'run_subagent' }], calls: [], result: { isError: false, output: '' } };
+			registry.window!.results = [text('Hi.')];
+			const { session, chat } = newChat();
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			await agent.chats.sendMessage(chat, 'Hi', [cwd], undefined, 'turn-1');
+
+			assert.strictEqual(registry.window!.requests[0].tools!.filter(tool => tool.name === 'run_subagent').length, 1);
+		});
+	});
+
+	test('without a Kodia window a turn fails fast', async () => {
+		const { agent, registry } = createAgent();
+		registry.window = undefined;
+		const { session, chat } = newChat();
+		const { signals } = watch(agent);
+		await agent.chats.createChat(chat, session, { workingDirectories: [cwd], model: { id: 'gemini/gemini-3-pro' } });
+
+		await agent.chats.sendMessage(chat, 'Hi', [cwd], undefined, 'turn-1');
+
+		assert.deepStrictEqual(actionTypes(signals), [ActionType.ChatError]);
+	});
+
+	test('abort cancels the model request in the Kodia window', async () => {
+		const { agent, registry } = createAgent();
+		let answer!: (result: IByokLmChatResult) => void;
+		registry.window!.pending = new Promise(resolve => answer = resolve);
+		const { session, chat } = newChat();
+		const { signals } = watch(agent);
+		await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+		const turn = agent.chats.sendMessage(chat, 'Hi', [cwd], undefined, 'turn-1');
+		while (registry.window!.tokens.length === 0) {
+			await new Promise(resolve => setTimeout(resolve, 0));
+		}
+		await agent.chats.abort(chat, session);
+		assert.strictEqual(registry.window!.tokens[0].isCancellationRequested, true);
+		answer({ output: [], error: 'Cancelled' });
+		await turn;
+
+		assert.deepStrictEqual(actionTypes(signals), [], 'the host records the cancellation itself');
+	});
+
+	suite('a reply that streams', () => {
+		/** The model's reasoning and text arrive in pieces, and the request ends when the test opens the gate. */
+		function streamingWindow(registry: FakeBridgeRegistry, ...replies: IByokLmChatDelta[][]) {
+			let open!: () => void;
+			registry.window!.stream = { replies, gate: new Promise<void>(resolve => open = resolve) };
+			return { open };
+		}
+
+		function reply(reasoning: string, answer: string, usage = { inputTokens: 10, outputTokens: 5 }): IByokLmChatResult {
+			return {
+				output: [
+					...reasoning ? [{ type: 'reasoning' as const, summary: [reasoning] }] : [],
+					{ type: 'message', content: [{ type: 'text', text: answer }] },
+				],
+				usage,
+			};
+		}
+
+		const waitFor = async (condition: () => boolean) => {
+			while (!condition()) {
+				await new Promise(resolve => setTimeout(resolve, 0));
+			}
+		};
+
+		const actionsOf = (signals: readonly AgentSignal[]): ChatAction[] => signals.filter((s): s is IAgentActionSignal => s.kind === 'action').map(s => s.action as ChatAction);
+
+		test('shows the reasoning and the text as the model writes them, before the request ends', async () => {
+			const { agent, registry } = createAgent();
+			const { open } = streamingWindow(registry, [{ reasoning: 'Let me ' }, { reasoning: 'think.' }, { text: 'Hel' }, { text: 'lo' }]);
+			registry.window!.results = [reply('Let me think.', 'Hello')];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			const turn = agent.chats.sendMessage(chat, 'Hi', [cwd], undefined, 'turn-1');
+			await waitFor(() => signals.length === 4);
+
+			// the window has not answered yet: this is what the Agents window shows while the model writes
+			const [reasoningPart, reasoningDelta, textPart, textDelta] = actionsOf(signals);
+			assert.deepStrictEqual(actionTypes(signals), [ActionType.ChatResponsePart, ActionType.ChatReasoning, ActionType.ChatResponsePart, ActionType.ChatDelta]);
+			assert.ok(reasoningPart.type === ActionType.ChatResponsePart && reasoningPart.part.kind === ResponsePartKind.Reasoning && reasoningPart.part.content === 'Let me ');
+			assert.ok(reasoningDelta.type === ActionType.ChatReasoning && reasoningDelta.partId === (reasoningPart as { part: { id: string } }).part.id && reasoningDelta.content === 'think.');
+			assert.ok(textPart.type === ActionType.ChatResponsePart && textPart.part.kind === ResponsePartKind.Markdown && textPart.part.content === 'Hel');
+			assert.ok(textDelta.type === ActionType.ChatDelta && textDelta.partId === (textPart as { part: { id: string } }).part.id && textDelta.content === 'lo');
+			assert.ok(textDelta.turnId === 'turn-1' && reasoningDelta.turnId === 'turn-1');
+
+			open();
+			await turn;
+
+			// the result adds nothing the stream showed, and the turn ends as it does without a stream
+			assert.deepStrictEqual(actionTypes(signals), [ActionType.ChatResponsePart, ActionType.ChatReasoning, ActionType.ChatResponsePart, ActionType.ChatDelta, ActionType.ChatUsage, ActionType.ChatTurnComplete]);
+		});
+
+		test('shows at the end what the stream stopped short of, and nothing of what it showed', async () => {
+			const { agent, registry } = createAgent();
+			const { open } = streamingWindow(registry, [{ reasoning: 'Hm' }, { text: 'Hel' }]);
+			open();
+			registry.window!.results = [reply('Hmm.', 'Hello!')];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			await agent.chats.sendMessage(chat, 'Hi', [cwd], undefined, 'turn-1');
+
+			// the reasoning, then the text, as the result lists them, each in the part the stream made
+			assert.deepStrictEqual(actionTypes(signals), [ActionType.ChatResponsePart, ActionType.ChatResponsePart, ActionType.ChatUsage, ActionType.ChatReasoning, ActionType.ChatDelta, ActionType.ChatTurnComplete]);
+			const [reasoningPart, textPart, , reasoningRest, textRest] = actionsOf(signals);
+			assert.ok(reasoningRest.type === ActionType.ChatReasoning && reasoningRest.partId === (reasoningPart as { part: { id: string } }).part.id && reasoningRest.content === 'm.');
+			assert.ok(textRest.type === ActionType.ChatDelta && textRest.partId === (textPart as { part: { id: string } }).part.id && textRest.content === 'lo!');
+		});
+
+		test('a reply that the stream did not show at all is shown whole at the end', async () => {
+			const { agent, registry } = createAgent();
+			const { open } = streamingWindow(registry, []);
+			open();
+			registry.window!.results = [text('Hello!')];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			await agent.chats.sendMessage(chat, 'Hi', [cwd], undefined, 'turn-1');
+
+			assert.deepStrictEqual(actionTypes(signals), [ActionType.ChatUsage, ActionType.ChatResponsePart, ActionType.ChatTurnComplete]);
+		});
+
+		test('keeps the text it showed when the result is not a continuation of it, as a part only grows', async () => {
+			const { agent, registry } = createAgent();
+			const { open } = streamingWindow(registry, [{ text: 'Hello <th' }]);
+			open();
+			registry.window!.results = [text('Hello')];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			await agent.chats.sendMessage(chat, 'Hi', [cwd], undefined, 'turn-1');
+
+			assert.deepStrictEqual(actionTypes(signals), [ActionType.ChatResponsePart, ActionType.ChatUsage, ActionType.ChatTurnComplete]);
+		});
+
+		test('each round of tool calls shows its own text', async () => {
+			const { agent, registry } = createAgent();
+			const { open } = streamingWindow(registry, [{ text: 'Let me ' }, { text: 'look.' }], [{ text: 'Do' }, { text: 'ne.' }]);
+			open();
+			registry.window!.results = [
+				{ output: [{ type: 'message', content: [{ type: 'text', text: 'Let me look.' }] }, { type: 'function_call', callId: 'call-1', name: 'ls_dir', argumentsJson: '{}' }] },
+				text('Done.'),
+			];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			await agent.chats.sendMessage(chat, 'What is here?', [cwd], undefined, 'turn-1');
+
+			assert.deepStrictEqual(actionTypes(signals), [
+				ActionType.ChatResponsePart, ActionType.ChatDelta,
+				ActionType.ChatToolCallStart, ActionType.ChatToolCallReady, ActionType.ChatToolCallComplete,
+				ActionType.ChatResponsePart, ActionType.ChatDelta,
+				ActionType.ChatUsage, ActionType.ChatTurnComplete,
+			]);
+			const [first, , , , , second] = actionsOf(signals);
+			assert.ok(first.type === ActionType.ChatResponsePart && second.type === ActionType.ChatResponsePart && first.part.kind === ResponsePartKind.Markdown && second.part.kind === ResponsePartKind.Markdown && first.part.id !== second.part.id);
+		});
+
+		test('stopping the turn cancels the request, leaves what was shown, and shows nothing more', async () => {
+			const { agent, registry } = createAgent();
+			streamingWindow(registry, [{ text: 'Hel' }]);
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			const turn = agent.chats.sendMessage(chat, 'Hi', [cwd], undefined, 'turn-1');
+			await waitFor(() => signals.length === 1);
+			await agent.chats.abort(chat, session);
+			assert.strictEqual(registry.window!.tokens[0].isCancellationRequested, true);
+			// the window may still write what it had in flight
+			registry.window!.latestOnDelta!({ text: 'lo' });
+			await turn;
+
+			// the host records the cancellation itself; the part shown stays in the turn it cancels
+			assert.deepStrictEqual(actionTypes(signals), [ActionType.ChatResponsePart]);
+		});
+
+		test('the history is the same as without a stream: the next request is sent the same conversation', async () => {
+			const sent: IByokLmChatRequest['input'][] = [];
+			for (const streaming of [false, true]) {
+				const { agent, registry } = createAgent();
+				if (streaming) {
+					streamingWindow(registry, [{ reasoning: 'Let me ' }, { reasoning: 'think.' }, { text: 'Hel' }, { text: 'lo' }]).open();
+				}
+				registry.window!.results = [reply('Let me think.', 'Hello'), text('Again!')];
+				const { session, chat } = newChat();
+				await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+				await agent.chats.sendMessage(chat, 'Hi', [cwd], undefined, 'turn-1');
+				await agent.chats.sendMessage(chat, 'And?', [cwd], undefined, 'turn-2');
+
+				sent.push(registry.window!.requests[1].input);
+			}
+			assert.deepStrictEqual(sent[1], sent[0]);
+			assert.deepStrictEqual(sent[0].map(item => item.type === 'message' ? item.role : item.type), ['user', 'reasoning', 'assistant', 'user']);
+		});
+	});
+
+	suite('a conversation that outgrows the model\'s context window', () => {
+		// a model with a window of 1,000 tokens: the history may take 800 before it is made smaller
+		const tiny: IByokLmModelInfo = { vendor: 'tiny', id: 'tiny-1', name: 'tiny-1', maxContextWindowTokens: 1_000 };
+		// a response that says the conversation takes 900 tokens
+		const full = (value: string): IByokLmChatResult => ({ ...text(value), usage: { inputTokens: 900, outputTokens: 5 } });
+		const userMessage = (value: string) => ({ type: 'message', role: 'user', content: [{ type: 'text', text: value }] });
+
+		async function tinyChat() {
+			const { agent, registry } = createAgent();
+			registry.setModels([gemini, openRouter, tiny]);
+			const { session, chat } = newChat();
+			const watched = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd], model: { id: 'tiny/tiny-1' } });
+			return { agent, registry, window: registry.window!, session, chat, ...watched };
+		}
+
+		const backing = (data: IAgentChatDataChange[]) => JSON.parse(data[data.length - 1].providerData as string);
+
+		test('clears the results of old tool calls first: the model gets a stub, the Agents window keeps the result', async () => {
+			const dir = fs.mkdtempSync(join(os.tmpdir(), 'kodia-context-'));
+			try {
+				fs.writeFileSync(join(dir, 'file.txt'), 'a line of the file\n'.repeat(40));
+				const { agent, window, session, chat, data } = await tinyChat();
+				window.results = [
+					{ output: [{ type: 'function_call', callId: 'call-1', name: 'read_file', argumentsJson: JSON.stringify({ uri: join(dir, 'file.txt') }) }] },
+					full('I read it.'),
+					text('Sure.'),
+				];
+
+				await agent.chats.sendMessage(chat, 'Read file.txt', [cwd], undefined, 'turn-1');
+				await agent.chats.sendMessage(chat, 'And now?', [cwd], undefined, 'turn-2');
+
+				assert.strictEqual(window.requests.length, 3, 'clearing was enough: the model was not asked for a summary');
+				const sent = window.requests[2].input;
+				assert.deepStrictEqual(sent.map(item => item.type === 'function_call_output' ? item.output : item.type), ['message', 'function_call', CLEARED_TOOL_RESULT, 'message', 'message']);
+				assert.strictEqual(window.requests[1].input[2].type === 'function_call_output' && window.requests[1].input[2].output.includes('a line of the file'), true, 'the result was sent as it was while it was recent');
+
+				const kept = backing(data);
+				assert.ok(kept.history[2].output.includes('a line of the file'), 'what the Agents window shows is not changed');
+				assert.deepStrictEqual(kept.compaction, { clearedBefore: 4 });
+				const turns = await agent.chats.getMessages(chat, session);
+				assert.deepStrictEqual(turns.map(t => t.message.text), ['Read file.txt', 'And now?']);
+			} finally {
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		test('then the model summarizes the older messages, and is sent the summary in their place, also after a restart', async () => {
+			const { agent, window, session, chat, data } = await tinyChat();
+			window.results = [full('First answer.'), text('- The user said one.'), full('Second answer.')];
+
+			await agent.chats.sendMessage(chat, 'one', [cwd], undefined, 'turn-1');
+			await agent.chats.sendMessage(chat, 'two', [cwd], undefined, 'turn-2');
+
+			const [, summaryRequest, request] = window.requests;
+			assert.strictEqual(summaryRequest.instructions, summarizeThread_systemMessage);
+			assert.deepStrictEqual(summaryRequest.tools, []);
+			const transcript = (summaryRequest.input[0] as { content: { text: string }[] }).content[0].text;
+			assert.ok(transcript.includes('USER:\none') && transcript.includes('ASSISTANT:\nFirst answer.'), transcript);
+			assert.ok(!transcript.includes('two'), 'the latest request is kept as it is');
+			assert.deepStrictEqual(request.input, [userMessage(summarizedThreadMessage('- The user said one.', undefined)), userMessage('two')]);
+
+			const kept = backing(data);
+			assert.strictEqual(kept.history.length, 4, 'the Agents window keeps the whole conversation');
+			assert.deepStrictEqual(kept.compaction, { clearedBefore: 0, summary: { text: '- The user said one.', keepFromIdx: 2 } });
+			assert.deepStrictEqual((await agent.chats.getMessages(chat, session)).map(t => t.message.text), ['one', 'two']);
+
+			// the summary is kept with the chat: a restored one goes on from it, with no new summary
+			const restored = createAgent();
+			restored.registry.window!.results = [text('Third answer.')];
+			await restored.agent.materializeChat(chat, session, data[data.length - 1].providerData);
+			await restored.agent.chats.sendMessage(chat, 'three', [cwd], undefined, 'turn-3');
+			assert.strictEqual(restored.registry.window!.requests.length, 1);
+			assert.deepStrictEqual(restored.registry.window!.requests[0].input.map(item => item.type === 'message' ? item.content[0].type === 'text' ? item.content[0].text : '' : item.type), [
+				summarizedThreadMessage('- The user said one.', undefined), 'two', 'Second answer.', 'three',
+			]);
+		});
+
+		test('a summary that fails is not asked for again until the conversation has grown, and the conversation goes on as it is', async () => {
+			const { agent, window, chat } = await tinyChat();
+			window.results = [full('First answer.'), { output: [], error: 'Rate limited.' }, full('Second answer.'), text('Third answer.')];
+
+			await agent.chats.sendMessage(chat, 'one', [cwd], undefined, 'turn-1');
+			await agent.chats.sendMessage(chat, 'two', [cwd], undefined, 'turn-2');
+			assert.strictEqual(window.requests[1].instructions, summarizeThread_systemMessage, 'it was tried');
+			assert.deepStrictEqual(window.requests[2].input.length, 3, 'and the conversation was sent whole');
+
+			await agent.chats.sendMessage(chat, 'three', [cwd], undefined, 'turn-3');
+			assert.strictEqual(window.requests.length, 4, 'not tried again');
+			assert.deepStrictEqual(window.requests[3].input.length, 5);
+		});
+
+		test('a conversation that fits is sent as it is, and so is one whose model has no known window', async () => {
+			const { agent, window, chat } = await tinyChat();
+			window.results = [text('First answer.'), text('Second answer.')];
+			await agent.chats.sendMessage(chat, 'one', [cwd], undefined, 'turn-1');
+			await agent.chats.sendMessage(chat, 'two', [cwd], undefined, 'turn-2');
+			assert.strictEqual(window.requests.length, 2);
+			assert.strictEqual(window.requests[1].input.length, 3);
+
+			// openRouter's model has no known window, so there is nothing to fit it to
+			const other = createAgent();
+			other.registry.window!.results = [full('First answer.'), full('Second answer.')];
+			const { session, chat: otherChat } = newChat();
+			await other.agent.chats.createChat(otherChat, session, { workingDirectories: [cwd], model: { id: 'openRouter/qwen/qwen3-coder' } });
+			await other.agent.chats.sendMessage(otherChat, 'one', [cwd], undefined, 'turn-1');
+			await other.agent.chats.sendMessage(otherChat, 'two', [cwd], undefined, 'turn-2');
+			assert.strictEqual(other.registry.window!.requests.length, 2);
+			assert.strictEqual(other.registry.window!.requests[1].input.length, 3);
+		});
+	});
+
+	suite('what the user lets run without asking, in Kodia\'s settings', () => {
+
+		const readyOf = (signals: readonly AgentSignal[], toolCallId: string) => signals.filter((s): s is IAgentActionSignal => s.kind === 'action')
+			.map(s => s.action).find(a => a.type === ActionType.ChatToolCallReady && a.toolCallId === toolCallId);
+		const approvalRequests = (signals: readonly AgentSignal[]) => signals.filter((s): s is IAgentToolPendingConfirmationSignal => s.kind === 'pending_confirmation');
+
+		test('runs a kind of tool the user switched on without asking, and asks about the others', async () => {
+			const dir = fs.mkdtempSync(join(os.tmpdir(), 'kodia-approve-'));
+			try {
+				const { agent, registry } = createAgent();
+				const window = registry.window!;
+				window.autoApprove = { edits: true, terminal: false };
+				window.results = [
+					{ output: [{ type: 'function_call', callId: 'call-1', name: 'create_file_or_folder', argumentsJson: JSON.stringify({ uri: join(dir, 'new.txt') }) }] },
+					{ output: [{ type: 'function_call', callId: 'call-2', name: 'run_command', argumentsJson: JSON.stringify({ command: 'echo hi' }) }] },
+					text('Done.'),
+				];
+				const { session, chat } = newChat();
+				const { signals } = watch(agent);
+				await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+				const turn = agent.chats.sendMessage(chat, 'Make a file, then run a command', [cwd], undefined, 'turn-1');
+				const request = await answerApproval(agent, signals, false);
+				await turn;
+
+				assert.deepStrictEqual(approvalRequests(signals).map(r => [r.state.toolCallId, r.permissionKind]), [['call-2', 'shell']], 'only the command is asked about');
+				assert.ok(fs.existsSync(join(dir, 'new.txt')), 'the file was created');
+				assert.strictEqual(request.state.toolCallId, 'call-2');
+				const ready = readyOf(signals, 'call-1');
+				assert.ok(ready && ready.type === ActionType.ChatToolCallReady && ready.confirmed === ToolCallConfirmationReason.Setting, 'recorded as approved by a setting');
+				assert.deepStrictEqual(window.requests[2].input.at(-1), { type: 'function_call_output', callId: 'call-2', output: 'The user denied this tool call.' });
+			} finally {
+				fs.rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
+		test('runs the window\'s MCP tools without asking when the user switched MCP tools on', async () => {
+			const { agent, registry } = createAgent();
+			const window = registry.window!;
+			window.autoApprove = { 'MCP tools': true };
+			window.mcp = { tools: [issueSearch], result: { isError: false, output: '3 issues' }, calls: [] };
+			window.results = [
+				{ output: [{ type: 'function_call', callId: 'call-1', name: 'a1b2_search', argumentsJson: '{"query":"bug"}' }] },
+				text('Found them.'),
+			];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			await agent.chats.sendMessage(chat, 'Look for bugs', [cwd], undefined, 'turn-1');
+
+			assert.deepStrictEqual(approvalRequests(signals), []);
+			assert.deepStrictEqual(window.mcp.calls, [{ name: 'a1b2_search', argsJson: '{"query":"bug"}' }]);
+			assert.deepStrictEqual(window.requests[1].input.at(-1), { type: 'function_call_output', callId: 'call-1', output: '3 issues' });
+		});
+
+		test('asks about everything when nothing is switched on, or the window does not say or can\'t be asked', async () => {
+			for (const autoApprove of [{}, { 'MCP tools': false, edits: true }, undefined, new Error('The window is busy.')]) {
+				const { agent, registry } = createAgent();
+				const window = registry.window!;
+				window.autoApprove = autoApprove;
+				window.mcp = { tools: [issueSearch], result: { isError: false, output: 'should not run' }, calls: [] };
+				window.results = [
+					{ output: [{ type: 'function_call', callId: 'call-1', name: 'a1b2_search', argumentsJson: '{}' }] },
+					text('Understood.'),
+				];
+				const { session, chat } = newChat();
+				const { signals } = watch(agent);
+				await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+				const turn = agent.chats.sendMessage(chat, 'Look for bugs', [cwd], undefined, 'turn-1');
+				const request = await answerApproval(agent, signals, false);
+				await turn;
+
+				assert.strictEqual(request.permissionKind, 'mcp', JSON.stringify(autoApprove));
+				assert.deepStrictEqual(window.mcp.calls, []);
+			}
+		});
+
+		test('never asks about a tool that only reads, whatever the settings', async () => {
+			const { agent, registry } = createAgent();
+			registry.window!.autoApprove = {};
+			registry.window!.results = [
+				{ output: [{ type: 'function_call', callId: 'call-1', name: 'ls_dir', argumentsJson: '{}' }] },
+				text('Done.'),
+			];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			await agent.chats.sendMessage(chat, 'What is here?', [cwd], undefined, 'turn-1');
+
+			assert.deepStrictEqual(approvalRequests(signals), []);
+			const ready = readyOf(signals, 'call-1');
+			assert.ok(ready && ready.type === ActionType.ChatToolCallReady && ready.confirmed === ToolCallConfirmationReason.NotNeeded);
+		});
+	});
+	suite('the editor tools, which an editor window runs', () => {
+
+		const ownTools = ['read_file', 'ls_dir', 'get_dir_tree', 'search_pathnames_only', 'search_for_files', 'search_codebase', 'search_in_file', 'create_file_or_folder', 'delete_file_or_folder', 'edit_file', 'rewrite_file', 'run_command', 'fetch_url', 'write_project_memory', 'git_status', 'git_diff', 'git_log', 'git_show', 'todo_write', 'run_subagent', ...persistentTerminalToolNames];
+		const definition: IKodiaMcpToolResult = { isError: false, output: 'src/a.ts:12\n```\nfunction a() {}\n```' };
+		const editorWindow = (result = definition) => { const window = new FakeKodiaWindow(); window.editor = { names: [...editorToolNames], result, calls: [] }; return window; };
+		const agentsWindow = () => { const window = new FakeKodiaWindow(); window.editor = { names: [], result: definition, calls: [] }; return window; };
+		const call = (name: string, args: object, callId = 'call-1') => ({ output: [{ type: 'function_call' as const, callId, name, argumentsJson: JSON.stringify(args) }] });
+		const readyOf = (signals: readonly AgentSignal[], toolCallId: string) => signals.filter((s): s is IAgentActionSignal => s.kind === 'action')
+			.map(s => s.action).find(a => a.type === ActionType.ChatToolCallReady && a.toolCallId === toolCallId);
+		const approvalRequests = (signals: readonly AgentSignal[]) => signals.filter((s): s is IAgentToolPendingConfirmationSignal => s.kind === 'pending_confirmation');
+
+		async function runTurn(registry: FakeBridgeRegistry, agent: KodiaAgent, prompt = 'Where is a defined?') {
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+			await agent.chats.sendMessage(chat, prompt, [cwd], undefined, 'turn-1');
+			return signals;
+		}
+
+		test('offers them after its own tools, and runs one in the editor window, without asking and with the path made absolute', async () => {
+			const { agent, registry } = createAgent();
+			const window = registry.window = editorWindow();
+			window.results = [call('go_to_definition', { uri: 'src/a.ts', line: 12, symbol: 'a' }), text('It is in a.ts.')];
+
+			const signals = await runTurn(registry, agent);
+
+			const tools = window.requests[0].tools!;
+			assert.deepStrictEqual(tools.map(t => t.name), [...ownTools, ...editorToolNames]);
+			const definitionTool = tools.find(t => t.name === 'go_to_definition')! as IByokLmFunctionTool;
+			assert.deepStrictEqual((definitionTool.parametersSchema as { required: string[] }).required, ['uri', 'line', 'symbol']);
+			assert.deepStrictEqual((definitionTool.parametersSchema as { properties: { line: { type: string } } }).properties.line.type, 'integer');
+			assert.deepStrictEqual(window.editor!.calls, [{ name: 'go_to_definition', argsJson: JSON.stringify({ uri: URI.joinPath(cwd, 'src/a.ts').fsPath, line: 12, symbol: 'a' }) }]);
+			assert.deepStrictEqual(window.requests[1].input.at(-1), { type: 'function_call_output', callId: 'call-1', output: definition.output });
+			assert.deepStrictEqual(approvalRequests(signals), []);
+			const ready = readyOf(signals, 'call-1');
+			assert.ok(ready && ready.type === ActionType.ChatToolCallReady && ready.confirmed === ToolCallConfirmationReason.NotNeeded, 'a tool that only reads is never asked about');
+			assert.ok(ready.type === ActionType.ChatToolCallReady && ready.invocationMessage === 'Find the definition of "a" in src/a.ts:12');
+		});
+
+		test('an absolute path is sent as it is, and a tool without a path is sent as it is', async () => {
+			const { agent, registry } = createAgent();
+			const window = registry.window = editorWindow();
+			const absolute = URI.joinPath(cwd, 'lib', 'b.ts').fsPath;
+			window.results = [call('read_lint_errors', { uri: absolute }), call('search_symbols', { query: 'getUser' }, 'call-2'), text('Done.')];
+
+			await runTurn(registry, agent);
+
+			assert.deepStrictEqual(window.editor!.calls, [
+				{ name: 'read_lint_errors', argsJson: JSON.stringify({ uri: absolute }) },
+				{ name: 'search_symbols', argsJson: '{"query":"getUser"}' },
+			]);
+		});
+
+		test('asks the other windows when the one serving the model has no editor, as the Agents Window has none', async () => {
+			const { agent, registry } = createAgent();
+			const agents = registry.window = agentsWindow();
+			const editor = editorWindow();
+			registry.others = [editor];
+			agents.results = [call('find_references', { uri: 'src/a.ts', line: 3, symbol: 'a' }), text('Used twice.')];
+
+			await runTurn(registry, agent);
+
+			assert.deepStrictEqual(agents.requests[0].tools!.map(t => t.name), [...ownTools, ...editorToolNames], 'the model runs in the Agents Window, the tools in the editor window');
+			assert.deepStrictEqual(editor.editor!.calls.map(c => c.name), ['find_references']);
+			assert.deepStrictEqual(agents.editor!.calls, []);
+			assert.strictEqual(editor.requests.length, 0, 'the editor window only runs the tool');
+		});
+
+		test('has only its own tools when no window can run them: the Agents Window alone, an older window, or one that can\'t be asked', async () => {
+			for (const window of [agentsWindow(), new FakeKodiaWindow(), (() => { const w = editorWindow(); w.editor!.listError = new Error('Not ready.'); return w; })()]) {
+				const { agent, registry } = createAgent();
+				registry.window = window;
+				window.results = [text('Done.')];
+
+				await runTurn(registry, agent);
+
+				assert.deepStrictEqual(window.requests[0].tools?.map(t => t.name), ownTools);
+			}
+		});
+
+		test('a tool that fails tells the model why, and a long result is cut', async () => {
+			const { agent, registry } = createAgent();
+			const window = registry.window = editorWindow({ isError: true, output: 'No contents; File does not exist.' });
+			window.results = [call('read_lint_errors', { uri: 'missing.ts' }), text('It is missing.')];
+			const signals = await runTurn(registry, agent);
+			assert.deepStrictEqual(window.requests[1].input.at(-1), { type: 'function_call_output', callId: 'call-1', output: 'No contents; File does not exist.' });
+			const complete = signals.filter((s): s is IAgentActionSignal => s.kind === 'action').map(s => s.action).find(a => a.type === ActionType.ChatToolCallComplete);
+			assert.ok(complete && complete.type === ActionType.ChatToolCallComplete && complete.result.success === false);
+
+			const long = createAgent();
+			const longWindow = long.registry.window = editorWindow({ isError: false, output: 'x'.repeat(150_000) });
+			longWindow.results = [call('search_symbols', { query: 'x' }), text('Many.')];
+			await runTurn(long.registry, long.agent);
+			const output = (longWindow.requests[1].input.at(-1) as { output: string }).output;
+			assert.strictEqual(output.length, 100_000 + '\n(The output is cut here.)'.length);
+		});
+
+		test('an MCP tool never takes the name of an editor tool, whether or not an editor window is open', async () => {
+			for (const window of [editorWindow(), new FakeKodiaWindow()]) {
+				const { agent, registry } = createAgent();
+				registry.window = window;
+				window.mcp = { tools: [{ ...issueSearch, name: 'go_to_definition' }, issueSearch], result: { isError: false, output: '' }, calls: [] };
+				window.results = [text('Done.')];
+
+				await runTurn(registry, agent);
+
+				const names = window.requests[0].tools!.map(t => t.name);
+				assert.strictEqual(names.filter(n => n === 'go_to_definition').length, window.editor ? 1 : 0);
+				assert.strictEqual(names.at(-1), 'a1b2_search');
+			}
+		});
+	});
+
+	suite('persistent terminals, which outlive a command', () => {
+
+		const call = (name: string, args: object, callId: string) => ({ output: [{ type: 'function_call' as const, callId, name, argumentsJson: JSON.stringify(args) }] });
+		const approvalRequests = (signals: readonly AgentSignal[]) => signals.filter((s): s is IAgentToolPendingConfirmationSignal => s.kind === 'pending_confirmation');
+		const completes = (signals: readonly AgentSignal[]) => signals.filter((s): s is IAgentActionSignal => s.kind === 'action').map(s => s.action).filter(a => a.type === ActionType.ChatToolCallComplete);
+
+		/** Waits for the nth approval request of the turns, and answers it. */
+		async function answerNth(agent: KodiaAgent, signals: AgentSignal[], n: number, approved: boolean): Promise<IAgentToolPendingConfirmationSignal> {
+			for (let i = 0; i < 400 && approvalRequests(signals).length <= n; i++) {
+				await new Promise(resolve => setTimeout(resolve, 1));
+			}
+			const request = approvalRequests(signals)[n];
+			assert.ok(request, `the agent asks for approval ${n + 1}`);
+			agent.respondToPermissionRequest(request.state.toolCallId, approved);
+			return request;
+		}
+
+		const echoHi = (terminals: FakeTerminalManager) => {
+			terminals.shell = (terminal, command) => {
+				terminal.start(command);
+				terminal.print('hi\r\n');
+				terminal.finish(0);
+			};
+		};
+
+		test('opens a terminal, runs a command in it and closes it, each asked about as a terminal command is', async () => {
+			const { agent, registry, terminals } = createAgent();
+			echoHi(terminals);
+			const window = registry.window!;
+			window.results = [
+				call('open_persistent_terminal', {}, 'call-1'),
+				call('run_persistent_command', { command: 'echo hi', persistent_terminal_id: '1' }, 'call-2'),
+				call('kill_persistent_terminal', { persistent_terminal_id: '1' }, 'call-3'),
+				text('Done.'),
+			];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			const turn = agent.chats.sendMessage(chat, 'Run echo hi in a terminal', [cwd], undefined, 'turn-1');
+			for (let i = 0; i < 3; i++) {
+				await answerNth(agent, signals, i, true);
+			}
+			await turn;
+
+			// the host's rules see the bare command; a terminal that opens or closes has none
+			assert.deepStrictEqual(approvalRequests(signals).map(r => [r.state.toolName, r.permissionKind, r.state.toolInput, r.state.confirmationTitle]), [
+				['open_persistent_terminal', 'shell', '', 'Open persistent terminal'],
+				['run_persistent_command', 'shell', 'echo hi', 'Run in terminal'],
+				['kill_persistent_terminal', 'shell', '', 'Close persistent terminal'],
+			]);
+			assert.strictEqual(approvalRequests(signals)[1].shellLanguage, isWindows ? undefined : 'bash');
+
+			assert.deepStrictEqual(window.requests[1].input.at(-1), { type: 'function_call_output', callId: 'call-1', output: 'Successfully created persistent terminal. persistentTerminalId="1"' });
+			assert.deepStrictEqual(window.requests[2].input.at(-1), { type: 'function_call_output', callId: 'call-2', output: 'hi\n(exit code 0)' });
+			assert.deepStrictEqual(window.requests[3].input.at(-1), { type: 'function_call_output', callId: 'call-3', output: 'Successfully closed terminal "1".' });
+
+			// the session claims the terminal, so the window shows it under the session
+			assert.strictEqual(terminals.created.length, 1);
+			assert.deepStrictEqual(terminals.created[0].params.claim, { kind: TerminalClaimKind.Session, session: parseRequiredSessionUriFromChatUri(chat), chat: chat.toString(), turnId: 'turn-1', toolCallId: 'call-1' });
+			assert.deepStrictEqual(terminals.created[0].typed, ['echo hi']);
+			assert.deepStrictEqual(terminals.disposed, [terminals.created[0].uri]);
+
+			// and the window shows the terminal with the commands that ran in it, and what they printed when it is gone
+			const run = completes(signals).find(a => a.type === ActionType.ChatToolCallComplete && a.toolCallId === 'call-2');
+			assert.ok(run && run.type === ActionType.ChatToolCallComplete);
+			assert.deepStrictEqual(run.result.content?.map(c => c.type), [ToolResultContentType.Terminal, ToolResultContentType.Text]);
+			assert.deepStrictEqual(run.result.content?.[0], { type: ToolResultContentType.Terminal, resource: terminals.created[0].uri, title: 'Kodia Agent', result: { exitCode: 0, preview: 'hi' } });
+			// opening and closing one are not commands: no terminal pill, and a message of their own
+			const opened = completes(signals).find(a => a.type === ActionType.ChatToolCallComplete && a.toolCallId === 'call-1');
+			assert.ok(opened && opened.type === ActionType.ChatToolCallComplete);
+			assert.deepStrictEqual([opened.result.pastTenseMessage, opened.result.content?.map(c => c.type)], ['Opened persistent terminal 1', [ToolResultContentType.Text]]);
+		});
+
+		test('runs them without asking when the user switched terminal commands on in Kodia\'s settings', async () => {
+			const { agent, registry, terminals } = createAgent();
+			echoHi(terminals);
+			const window = registry.window!;
+			window.autoApprove = { terminal: true };
+			window.results = [
+				call('open_persistent_terminal', {}, 'call-1'),
+				call('run_persistent_command', { command: 'echo hi', persistent_terminal_id: '1' }, 'call-2'),
+				text('Done.'),
+			];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			await agent.chats.sendMessage(chat, 'Run echo hi in a terminal', [cwd], undefined, 'turn-1');
+
+			assert.deepStrictEqual(approvalRequests(signals), []);
+			assert.deepStrictEqual(terminals.created[0].typed, ['echo hi']);
+		});
+
+		test('does not run a command the user denied', async () => {
+			const { agent, registry, terminals } = createAgent();
+			echoHi(terminals);
+			const window = registry.window!;
+			window.results = [
+				call('open_persistent_terminal', {}, 'call-1'),
+				call('run_persistent_command', { command: 'rm -rf node_modules', persistent_terminal_id: '1' }, 'call-2'),
+				text('Done.'),
+			];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			const turn = agent.chats.sendMessage(chat, 'Clean up', [cwd], undefined, 'turn-1');
+			await answerNth(agent, signals, 0, true);
+			await answerNth(agent, signals, 1, false);
+			await turn;
+
+			assert.deepStrictEqual(terminals.created[0].typed, []);
+			assert.deepStrictEqual(window.requests[2].input.at(-1), { type: 'function_call_output', callId: 'call-2', output: 'The user denied this tool call.' });
+		});
+
+		test('keeps a terminal for the next turns, and takes it away with the chat', async () => {
+			const { agent, registry, terminals } = createAgent();
+			echoHi(terminals);
+			const window = registry.window!;
+			window.autoApprove = { terminal: true };
+			window.results = [call('open_persistent_terminal', {}, 'call-1'), text('Opened.')];
+			const { session, chat } = newChat();
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+			await agent.chats.sendMessage(chat, 'Open a terminal', [cwd], undefined, 'turn-1');
+			assert.deepStrictEqual(terminals.disposed, [], 'the turn ended, the terminal did not');
+
+			window.results = [call('run_persistent_command', { command: 'echo hi', persistent_terminal_id: '1' }, 'call-2'), text('Ran.')];
+			await agent.chats.sendMessage(chat, 'Run echo hi', [cwd], undefined, 'turn-2');
+			assert.deepStrictEqual(terminals.created.length, 1, 'the second turn used the terminal of the first');
+			assert.deepStrictEqual(window.requests.at(-1)!.input.at(-1), { type: 'function_call_output', callId: 'call-2', output: 'hi\n(exit code 0)' });
+
+			await agent.chats.disposeChat(chat, session);
+			assert.deepStrictEqual(terminals.disposed, [terminals.created[0].uri]);
+		});
+
+		test('a turn the user stops takes away the terminals it opened, and not those of the turns before', async () => {
+			const { agent, registry, terminals } = createAgent();
+			echoHi(terminals);
+			const window = registry.window!;
+			window.autoApprove = { terminal: true };
+			window.results = [call('open_persistent_terminal', {}, 'call-1'), text('Opened.')];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+			await agent.chats.sendMessage(chat, 'Open a terminal', [cwd], undefined, 'turn-1');
+
+			// turn 2 opens another one, then waits for the user to approve a command: who stops the turn instead
+			window.autoApprove = { terminal: false };
+			window.results = [call('open_persistent_terminal', {}, 'call-2'), call('run_persistent_command', { command: 'npm run dev', persistent_terminal_id: '2' }, 'call-3'), text('Never.')];
+			const turn = agent.chats.sendMessage(chat, 'Start the server', [cwd], undefined, 'turn-2');
+			await answerNth(agent, signals, 0, true);
+			for (let i = 0; i < 400 && approvalRequests(signals).length < 2; i++) {
+				await new Promise(resolve => setTimeout(resolve, 1));
+			}
+			assert.strictEqual(approvalRequests(signals).length, 2, 'the command waits for the user');
+			await agent.chats.abort(chat, session);
+			await turn;
+
+			assert.strictEqual(terminals.created.length, 2);
+			assert.deepStrictEqual(terminals.disposed, [terminals.created[1].uri]);
+			assert.ok(terminals.terminals.has(terminals.created[0].uri), 'the terminal of the first turn is still there');
+		});
+
+		test('shows a command left running as background work of the chat, outside of the turn, and holds the chat until it ends', async () => {
+			const { agent, registry, terminals } = createAgent();
+			const window = registry.window!;
+			window.autoApprove = { terminal: true };
+			window.results = [
+				call('open_persistent_terminal', {}, 'call-1'),
+				call('run_persistent_command', { command: 'npm run dev', persistent_terminal_id: '1' }, 'call-2'),
+				text('The server runs.'),
+			];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			terminals.shell = (terminal, command) => {
+				terminal.start(command);
+				terminal.print('ready on :3000\r\n');
+				// the user lets the command go on in the background: the call returns, the command does not end
+				terminal.onDidChangeClaim.fire({ kind: TerminalClaimKind.Session, session: parseRequiredSessionUriFromChatUri(chat), chat: chat.toString(), turnId: 'turn-1' });
+			};
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+			const backgroundWork = () => signals.filter((s): s is IAgentActionSignal => s.kind === 'action' && (s.action.type === ActionType.ChatBackgroundWorkSet || s.action.type === ActionType.ChatBackgroundWorkRemoved));
+			assert.strictEqual(await agent.chats.canReleaseChat!(chat, session), true, 'nothing runs');
+
+			await agent.chats.sendMessage(chat, 'Start the dev server', [cwd], undefined, 'turn-1');
+
+			const [set, ...others] = backgroundWork();
+			assert.deepStrictEqual(others, []);
+			assert.strictEqual(set.resource.toString(), chat.toString());
+			assert.ok(set.action.type === ActionType.ChatBackgroundWorkSet);
+			assert.deepStrictEqual({ ...set.action.work, startedAt: undefined }, { kind: BackgroundWorkKind.Shell, id: 'shell:1', label: 'npm run dev', command: 'npm run dev', terminal: terminals.created[0].uri, startedAt: undefined });
+			assert.strictEqual(await agent.chats.canReleaseChat!(chat, session), false, 'its state shows the command: idle eviction would drop it');
+
+			terminals.created[0].finish(0);
+
+			const [, removed, ...rest] = backgroundWork();
+			assert.deepStrictEqual(rest, []);
+			assert.deepStrictEqual([removed.resource.toString(), removed.action], [chat.toString(), { type: ActionType.ChatBackgroundWorkRemoved, id: 'shell:1' }]);
+			assert.strictEqual(await agent.chats.canReleaseChat!(chat, session), true);
+		});
+
+		test('takes the background work away with the chat', async () => {
+			const { agent, registry, terminals } = createAgent();
+			const window = registry.window!;
+			window.autoApprove = { terminal: true };
+			window.results = [
+				call('open_persistent_terminal', {}, 'call-1'),
+				call('run_persistent_command', { command: 'npm run dev', persistent_terminal_id: '1' }, 'call-2'),
+				text('The server runs.'),
+			];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			terminals.shell = (terminal, command) => {
+				terminal.start(command);
+				terminal.onDidChangeClaim.fire({ kind: TerminalClaimKind.Session, session: parseRequiredSessionUriFromChatUri(chat), chat: chat.toString(), turnId: 'turn-1' });
+			};
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+			await agent.chats.sendMessage(chat, 'Start the dev server', [cwd], undefined, 'turn-1');
+
+			await agent.chats.disposeChat(chat, session);
+
+			const work = signals.filter((s): s is IAgentActionSignal => s.kind === 'action').map(s => s.action).filter(a => a.type === ActionType.ChatBackgroundWorkSet || a.type === ActionType.ChatBackgroundWorkRemoved);
+			assert.deepStrictEqual(work.map(a => a.type), [ActionType.ChatBackgroundWorkSet, ActionType.ChatBackgroundWorkRemoved]);
+		});
+
+		test('kills the terminals when the agent shuts down', async () => {
+			const { agent, registry, terminals } = createAgent();
+			const window = registry.window!;
+			window.autoApprove = { terminal: true };
+			window.results = [call('open_persistent_terminal', {}, 'call-1'), call('open_persistent_terminal', {}, 'call-2'), text('Opened.')];
+			const { session, chat } = newChat();
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+			await agent.chats.sendMessage(chat, 'Open two terminals', [cwd], undefined, 'turn-1');
+			assert.strictEqual(terminals.terminals.size, 2);
+
+			await agent.shutdown();
+
+			assert.deepStrictEqual(terminals.disposed.sort(), terminals.created.map(t => t.uri).sort());
+		});
+
+		test('an MCP tool never takes the name of a persistent terminal tool', async () => {
+			const { agent, registry } = createAgent();
+			registry.window!.mcp = { tools: [{ ...issueSearch, name: 'open_persistent_terminal' }, issueSearch], result: { isError: false, output: '' }, calls: [] };
+			registry.window!.results = [text('Done.')];
+			const { session, chat } = newChat();
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			await agent.chats.sendMessage(chat, 'Hi', [cwd], undefined, 'turn-1');
+
+			const names = registry.window!.requests[0].tools!.map(t => t.name);
+			assert.strictEqual(names.filter(n => n === 'open_persistent_terminal').length, 1);
+			assert.strictEqual(names.at(-1), 'a1b2_search');
+		});
+	});
+	suite('what the user attaches to a message, with "Add Context..."', () => {
+		const fsPath = (path: string) => URI.file(path).fsPath;
+		const file = (path: string, extra: Partial<MessageAttachment> = {}): MessageAttachment => ({ type: MessageAttachmentKind.Resource, uri: URI.file(path).toString(), label: path.slice(path.lastIndexOf('/') + 1), displayKind: 'document', ...extra } as MessageAttachment);
+		const png = encodeBase64(VSBuffer.fromString('fake-png-bytes'));
+		/** What the model was sent of the user's message in its first request. */
+		const sentParts = (registry: FakeBridgeRegistry, request = 0): IByokLmContentPart[] => (registry.window!.requests[request].input[0] as IByokLmMessageItem).content;
+		const texts = (parts: readonly IByokLmContentPart[]) => parts.map(part => part.type === 'text' ? part.text : `<${part.type}>`);
+
+		async function send(attachments: MessageAttachment[], options: { model?: string; files?: Record<string, string> } = {}) {
+			const { agent, registry, write } = createAgent();
+			registry.window!.results = [text('Done.')];
+			for (const [path, content] of Object.entries(options.files ?? {})) {
+				await write(path, content);
+			}
+			const project = URI.file('/project');
+			const { session, chat } = newChat();
+			const watched = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [project], ...options.model ? { model: { id: options.model } } : {} });
+			await agent.chats.sendMessage(chat, 'What is this?', [project], attachments, 'turn-1');
+			return { agent, registry, session, chat, ...watched };
+		}
+
+		test('a file is text in the message of the user, after the prompt: its path, then its content', async () => {
+			const { registry } = await send([file('/project/src/a.ts')], { files: { '/project/src/a.ts': 'export const a = 1;' } });
+
+			assert.deepStrictEqual(sentParts(registry), [
+				{ type: 'text', text: 'What is this?' },
+				{ type: 'text', text: `Attached file: ${fsPath('/project/src/a.ts')}\n\`\`\`\nexport const a = 1;\n\`\`\`` },
+			]);
+		});
+
+		test('a file longer than a page of read_file is cut there, and the model is told how to read the rest', async () => {
+			const { registry } = await send([file('/project/big.txt')], { files: { '/project/big.txt': 'x'.repeat(150_000) } });
+
+			const [, attached] = texts(sentParts(registry));
+			assert.ok(attached.startsWith(`Attached file: ${fsPath('/project/big.txt')}\n\`\`\`\n${'x'.repeat(100_000)}\n\`\`\``), 'the first 100,000 characters');
+			assert.ok(attached.endsWith('(This file is cut here: the first 100000 of its 150000 characters are shown. read_file with page_number 2 gives the rest.)'), attached.slice(-200));
+			assert.strictEqual(attached.length < 100_400, true);
+		});
+
+		test('a selection keeps its path and its lines, and only those are sent', async () => {
+			const files = { '/project/a.ts': 'line 1\nline 2\nline 3\nline 4' };
+			const range = (startLine: number, startCharacter: number, endLine: number, endCharacter: number) => ({ start: { line: startLine, character: startCharacter }, end: { line: endLine, character: endCharacter } });
+
+			// from the start of line 2 to the start of line 4: lines 2 and 3, as the editor numbers them
+			let { registry } = await send([file('/project/a.ts', { displayKind: 'selection', selection: { range: range(1, 0, 3, 0) } })], { files });
+			assert.strictEqual(texts(sentParts(registry))[1], `Attached selection of ${fsPath('/project/a.ts')} (lines 2-3):\n\`\`\`\nline 2\nline 3\n\`\`\``);
+
+			// a part of one line
+			({ registry } = await send([file('/project/a.ts', { displayKind: 'selection', selection: { range: range(2, 5, 2, 6) } })], { files }));
+			assert.strictEqual(texts(sentParts(registry))[1], `Attached selection of ${fsPath('/project/a.ts')} (line 3):\n\`\`\`\n3\n\`\`\``);
+
+			// the text the editor had when the user attached it, which the file on disk may not have
+			({ registry } = await send([file('/project/a.ts', { displayKind: 'selection', selection: { range: range(1, 0, 2, 6) }, _meta: { 'copilot.attachmentDetail': { type: 'selection', text: 'unsaved 2\nunsaved 3' } } })], { files }));
+			assert.strictEqual(texts(sentParts(registry))[1], `Attached selection of ${fsPath('/project/a.ts')} (lines 2-3):\n\`\`\`\nunsaved 2\nunsaved 3\n\`\`\``);
+		});
+
+		test('a folder is its listing: the folders first, then the files', async () => {
+			const { registry } = await send([file('/project/dir', { displayKind: 'directory' })], { files: { '/project/dir/b.ts': '', '/project/dir/sub/c.ts': '', '/project/dir/a.ts': '' } });
+
+			assert.deepStrictEqual(texts(sentParts(registry)).slice(1), [`Attached folder: ${fsPath('/project/dir')}\n\`\`\`\nsub/\na.ts\nb.ts\n\`\`\``]);
+		});
+
+		test('pasted text is text too, and what cannot be used is said, not dropped', async () => {
+			const embedded = (label: string, contentType: string, content: string): MessageAttachment => ({ type: MessageAttachmentKind.EmbeddedResource, label, contentType, data: encodeBase64(VSBuffer.fromString(content)) });
+			const { registry } = await send([
+				embedded('notes.txt', 'text/plain', 'remember this'),
+				{ type: MessageAttachmentKind.Simple, label: 'Page', modelRepresentation: 'The page says hi.' },
+				{ type: MessageAttachmentKind.Simple, label: 'a command' },
+				embedded('doc.pdf', 'application/pdf', '%PDF'),
+				file('/project/missing.ts'),
+				file('/project/bin.dat'),
+				{ type: MessageAttachmentKind.Annotations, label: 'Comments', resource: 'ahp-session:/x/annotations' },
+			], { files: { '/project/bin.dat': 'PK\u0000\u0001' } });
+
+			const [, notes, page, pdf, missing, binary, comments, ...others] = texts(sentParts(registry));
+			assert.strictEqual(notes, 'Attached "notes.txt":\n```\nremember this\n```');
+			assert.strictEqual(page, 'Attached context "Page":\n```\nThe page says hi.\n```');
+			assert.strictEqual(pdf, 'The user attached "doc.pdf" (application/pdf), which this agent cannot read.');
+			assert.ok(missing.startsWith(`The user attached the file "missing.ts" (${fsPath('/project/missing.ts')}), but it could not be read: `), missing);
+			assert.strictEqual(binary, `The user attached the file ${fsPath('/project/bin.dat')}, which is binary: it is not shown.`);
+			assert.strictEqual(comments, 'The user attached review comments ("Comments"), which this agent cannot read.');
+			assert.deepStrictEqual(others, [], 'a command has nothing for the model');
+		});
+
+		suite('images', () => {
+			const embeddedImage = (data = png, contentType = 'image/png'): MessageAttachment => ({ type: MessageAttachmentKind.EmbeddedResource, label: 'shot.png', displayKind: 'image', contentType, data });
+
+			test('are sent as media to a model that sees images, from the data of the message or from a file', async () => {
+				const fromFile = file('/project/photo.png', { displayKind: 'image', _meta: toHostSnapshotAttachmentMeta('image/png') });
+				const { registry } = await send([embeddedImage(), fromFile], { files: { '/project/photo.png': 'fake-png-bytes' } });
+
+				assert.deepStrictEqual(sentParts(registry).slice(1), [
+					{ type: 'text', text: 'Attached image: shot.png' }, { type: 'image', mimeType: 'image/png', data: png },
+					{ type: 'text', text: 'Attached image: photo.png' }, { type: 'image', mimeType: 'image/png', data: png },
+				]);
+			});
+
+			test('are said to a model that cannot see them, which is sent no image', async () => {
+				const { registry } = await send([embeddedImage()], { model: 'openRouter/qwen/qwen3-coder' });
+
+				assert.deepStrictEqual(sentParts(registry), [
+					{ type: 'text', text: 'What is this?' },
+					{ type: 'text', text: 'The user attached the image "shot.png", but the model cannot see images, so you cannot see it. If the request depends on it, tell the user.' },
+				]);
+			});
+
+			test('that cannot be sent (a type no provider takes, too large) are said too', async () => {
+				const { registry } = await send([embeddedImage(png, 'image/svg+xml'), embeddedImage('A'.repeat(7_000_000))]);
+
+				assert.deepStrictEqual(texts(sentParts(registry)).slice(1), [
+					'The user attached the image "shot.png", which is image/svg+xml: only PNG, JPEG, WebP and GIF images can be sent to the model, so you cannot see it.',
+					'The user attached the image "shot.png", which is larger than 5 MB: it is not sent, so you cannot see it.',
+				]);
+			});
+
+			test('stay in the history, and a model that cannot see them is sent a note in their place', async () => {
+				const { agent, registry, session, chat, data } = await send([embeddedImage()]);
+				registry.window!.results = [text('Still here.')];
+
+				await agent.chats.changeModel(chat, { id: 'openRouter/qwen/qwen3-coder' }, session);
+				await agent.chats.sendMessage(chat, 'And now?', [URI.file('/project')], undefined, 'turn-2');
+
+				assert.deepStrictEqual(texts(sentParts(registry, 1)), ['What is this?', 'Attached image: shot.png', IMAGE_NOT_SEEN_NOTE]);
+				const kept = JSON.parse(data[data.length - 1].providerData as string);
+				assert.deepStrictEqual(kept.history[0].content[2], { type: 'image', mimeType: 'image/png', data: png }, 'the history keeps the image');
+				assert.strictEqual((await agent.chats.getMessages(chat, session))[0].message.text, 'What is this?');
+			});
+		});
+
+		test('stay with the turn: a restored chat shows them, and the model goes on from them', async () => {
+			const resource = file('/project/src/a.ts', { range: { start: { line: 0, character: 8 }, end: { line: 0, character: 16 } } });
+			const embedded: MessageAttachment = { type: MessageAttachmentKind.EmbeddedResource, label: 'notes.txt', displayKind: 'document', contentType: 'text/plain', data: encodeBase64(VSBuffer.fromString('remember this')) };
+			const { agent, session, chat, data } = await send([resource, embedded], { files: { '/project/src/a.ts': 'export const a = 1;' } });
+
+			const turns = await agent.chats.getMessages(chat, session);
+			assert.strictEqual(turns[0].message.text, 'What is this?', 'the message is what the user typed');
+			const expected = [resource, { type: MessageAttachmentKind.Simple, label: 'notes.txt', displayKind: 'document' }];
+			assert.deepStrictEqual(turns[0].message.attachments, expected, 'an embedded attachment is kept without its data');
+
+			const restored = createAgent();
+			restored.registry.window!.results = [text('Back.')];
+			await restored.agent.materializeChat(chat, session, data[data.length - 1].providerData);
+			assert.deepStrictEqual((await restored.agent.chats.getMessages(chat, session))[0].message.attachments, expected);
+			await restored.agent.chats.sendMessage(chat, 'And now?', [URI.file('/project')], undefined, 'turn-2');
+			assert.deepStrictEqual(texts(sentParts(restored.registry)), [
+				'What is this?',
+				`Attached file: ${fsPath('/project/src/a.ts')}\n\`\`\`\nexport const a = 1;\n\`\`\``,
+				'Attached "notes.txt":\n```\nremember this\n```',
+			], 'what the model was sent is what it is sent again');
+		});
+
+		test('a chat saved before attachments still loads', async () => {
+			const { agent } = createAgent();
+			const { session, chat } = newChat();
+			const providerData = JSON.stringify({
+				history: [
+					{ type: 'message', role: 'user', content: [{ type: 'text', text: 'Hi' }] },
+					{ type: 'message', role: 'assistant', content: [{ type: 'text', text: 'Hello' }] },
+				],
+				turnIds: ['turn-1'],
+				createdAt: 1,
+			});
+
+			await agent.materializeChat(chat, session, providerData);
+
+			const turns = await agent.chats.getMessages(chat, session);
+			assert.deepStrictEqual(turns.map(t => [t.id, t.message.text, t.message.attachments]), [['turn-1', 'Hi', undefined]]);
+		});
+
+		test('count in the context window: a conversation they make too long is made smaller', async () => {
+			// a model with a window of 1,000 tokens: the history may take 800 before it is made smaller
+			const tiny: IByokLmModelInfo = { vendor: 'tiny', id: 'tiny-1', name: 'tiny-1', maxContextWindowTokens: 1_000 };
+			const { agent, registry, write } = createAgent();
+			registry.setModels([gemini, openRouter, tiny]);
+			await write('/project/big.txt', 'x'.repeat(3_000));
+			registry.window!.results = [text('First answer.'), text('- The user said one.'), text('Second answer.')];
+			const { session, chat } = newChat();
+			await agent.chats.createChat(chat, session, { workingDirectories: [URI.file('/project')], model: { id: 'tiny/tiny-1' } });
+
+			await agent.chats.sendMessage(chat, 'one', [URI.file('/project')], undefined, 'turn-1');
+			await agent.chats.sendMessage(chat, 'two', [URI.file('/project')], [file('/project/big.txt')], 'turn-2');
+
+			assert.strictEqual(registry.window!.requests.length, 3, 'the older messages were summarized before the request');
+			assert.strictEqual(registry.window!.requests[1].instructions, summarizeThread_systemMessage);
+		});
+	});
+
+	suite('a reply the model cut at its output limit', () => {
+		const cut = (partial: string): IByokLmChatResult => ({ ...text(partial), reachedOutputLimit: true });
+		const CONTINUE_PROMPT = 'Continue from exactly where you stopped.';
+
+		/** The question the agent asked the user, once it has. */
+		async function question(signals: AgentSignal[]): Promise<{ request: ChatInputRequest; questionId: string; optionId: string }> {
+			const asked = () => signals.filter((s): s is IAgentActionSignal => s.kind === 'action').map(s => s.action).find(a => a.type === ActionType.ChatInputRequested);
+			while (!asked()) {
+				await new Promise(resolve => setTimeout(resolve, 0));
+			}
+			const request = (asked() as { request: ChatInputRequest }).request;
+			const [q] = request.questions!;
+			assert.strictEqual(q.kind, ChatInputQuestionKind.SingleSelect);
+			return { request, questionId: q.id, optionId: (q as { options: { id: string }[] }).options[0].id };
+		}
+
+		const answerWith = (questionId: string, optionId: string): Record<string, ChatInputAnswer> => ({ [questionId]: { state: ChatInputAnswerState.Submitted, value: { kind: ChatInputAnswerValueKind.Selected, value: optionId } } });
+
+		test('asks the user whether to continue, and goes on from where it stopped when they do', async () => {
+			const { agent, registry } = createAgent();
+			registry.window!.results = [cut('The first half of'), text(' the answer.')];
+			const { session, chat } = newChat();
+			const { signals, data } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			const turn = agent.chats.sendMessage(chat, 'Write it', [cwd], undefined, 'turn-1');
+			const { request, questionId, optionId } = await question(signals);
+			assert.strictEqual(request.questions!.length, 1);
+			assert.strictEqual((request.questions![0] as { allowFreeformInput?: boolean }).allowFreeformInput, false);
+			assert.deepStrictEqual((request.questions![0] as { options: { label: string }[] }).options.map(o => o.label), ['Continue']);
+			assert.strictEqual(registry.window!.requests.length, 1, 'the model is not asked again before the user answers');
+
+			agent.respondToUserInputRequest(request.id, ChatInputResponseKind.Accept, answerWith(questionId, optionId));
+			await turn;
+
+			assert.strictEqual(registry.window!.requests.length, 2);
+			assert.deepStrictEqual(
+				registry.window!.requests[1].input.map(item => item.type === 'message' ? `${item.role}: ${item.content.map(part => part.type === 'text' ? part.text : '').join('')}` : item.type),
+				['user: Write it', 'assistant: The first half of', `user: ${CONTINUE_PROMPT}`],
+			);
+			assert.deepStrictEqual(actionTypes(signals), [
+				ActionType.ChatUsage, ActionType.ChatResponsePart, ActionType.ChatInputRequested,
+				ActionType.ChatUsage, ActionType.ChatResponsePart, ActionType.ChatTurnComplete,
+			]);
+			assert.ok(data.length > 0);
+		});
+
+		test('ends the turn when the user does not continue', async () => {
+			const { agent, registry } = createAgent();
+			registry.window!.results = [cut('The first half of'), text('never asked for')];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			const turn = agent.chats.sendMessage(chat, 'Write it', [cwd], undefined, 'turn-1');
+			const { request } = await question(signals);
+			agent.respondToUserInputRequest(request.id, ChatInputResponseKind.Decline);
+			await turn;
+
+			assert.strictEqual(registry.window!.requests.length, 1);
+			assert.deepStrictEqual(actionTypes(signals), [ActionType.ChatUsage, ActionType.ChatResponsePart, ActionType.ChatInputRequested, ActionType.ChatTurnComplete]);
+		});
+
+		test('ends the turn when the answer is not the one offered', async () => {
+			const { agent, registry } = createAgent();
+			registry.window!.results = [cut('The first half of'), text('never asked for')];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			const turn = agent.chats.sendMessage(chat, 'Write it', [cwd], undefined, 'turn-1');
+			const { request, questionId } = await question(signals);
+			agent.respondToUserInputRequest(request.id, ChatInputResponseKind.Accept, answerWith(questionId, 'something else'));
+			await turn;
+
+			assert.strictEqual(registry.window!.requests.length, 1);
+		});
+
+		test('stopping the turn while the question waits ends it', async () => {
+			const { agent, registry } = createAgent();
+			registry.window!.results = [cut('The first half of'), text('never asked for')];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			const turn = agent.chats.sendMessage(chat, 'Write it', [cwd], undefined, 'turn-1');
+			await question(signals);
+			await agent.chats.abort(chat, session);
+			await turn;
+
+			assert.strictEqual(registry.window!.requests.length, 1);
+			assert.ok(!actionTypes(signals).includes(ActionType.ChatTurnComplete), 'the host records the cancellation itself');
+		});
+
+		test('asks nothing of a reply that ended by itself, and not of one that goes on with tools', async () => {
+			const { agent, registry } = createAgent();
+			registry.window!.results = [{ output: [{ type: 'function_call', callId: 'call-1', name: 'ls_dir', argumentsJson: '{}' }], reachedOutputLimit: true }, text('Done.')];
+			const { session, chat } = newChat();
+			const { signals } = watch(agent);
+			await agent.chats.createChat(chat, session, { workingDirectories: [cwd] });
+
+			await agent.chats.sendMessage(chat, 'What is here?', [cwd], undefined, 'turn-1');
+
+			assert.ok(!actionTypes(signals).includes(ActionType.ChatInputRequested));
+			assert.strictEqual(registry.window!.requests.length, 2);
+		});
+	});
+});
